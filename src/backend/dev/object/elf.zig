@@ -362,11 +362,21 @@ pub const ElfWriter = struct {
         const SHIDX_BSS = 13;
         const NUM_SECTIONS = 14;
 
+        // Constant data that holds absolute pointers needs a load-time
+        // relocation per pointer whenever the output is position independent
+        // (shared libraries and PIE), and ELF linkers reject dynamic
+        // relocations in a read-only section. Such data goes in
+        // `.data.rel.ro`, which the linker places in the RELRO segment: the
+        // loader applies the relocations and then maps it read-only. This is
+        // the section PIC toolchains use for pointer-holding constants, and
+        // the counterpart of the Mach-O writer's `__DATA,__const`.
+        const readonly_section = elfReadonlySection(self.rodata_relocs.items.len != 0);
+
         // Add section names to shstrtab
         const shname_text = try self.addString(&self.shstrtab, ".text");
-        const shname_rodata = try self.addString(&self.shstrtab, ".rodata");
+        const shname_rodata = try self.addString(&self.shstrtab, readonly_section.name);
         const shname_rela_text = try self.addString(&self.shstrtab, ".rela.text");
-        const shname_rela_rodata = try self.addString(&self.shstrtab, ".rela.rodata");
+        const shname_rela_rodata = try self.addString(&self.shstrtab, readonly_section.relocation_name);
         const shname_symtab = try self.addString(&self.shstrtab, ".symtab");
         const shname_strtab = try self.addString(&self.shstrtab, ".strtab");
         const shname_shstrtab = try self.addString(&self.shstrtab, ".shstrtab");
@@ -578,13 +588,13 @@ pub const ElfWriter = struct {
         // 1: .text
         appendShdr(output, .{ .sh_name = shname_text, .sh_type = ELF.SHT_PROGBITS, .sh_flags = ELF.SHF_ALLOC | ELF.SHF_EXECINSTR, .sh_offset = text_offset, .sh_size = self.text.len, .sh_addralign = 16 });
 
-        // 2: .rodata
-        appendShdr(output, .{ .sh_name = shname_rodata, .sh_type = ELF.SHT_PROGBITS, .sh_flags = ELF.SHF_ALLOC, .sh_offset = rodata_offset, .sh_size = self.rodata.len, .sh_addralign = 16 });
+        // 2: .rodata, or .data.rel.ro when it holds relocated pointers
+        appendShdr(output, .{ .sh_name = shname_rodata, .sh_type = ELF.SHT_PROGBITS, .sh_flags = readonly_section.flags, .sh_offset = rodata_offset, .sh_size = self.rodata.len, .sh_addralign = 16 });
 
         // 3: .rela.text
         appendShdr(output, .{ .sh_name = shname_rela_text, .sh_type = ELF.SHT_RELA, .sh_flags = ELF.SHF_INFO_LINK, .sh_offset = rela_text_offset, .sh_size = rela_text_size, .sh_link = SHIDX_SYMTAB, .sh_info = SHIDX_TEXT, .sh_addralign = 8, .sh_entsize = @sizeOf(Elf64_Rela) });
 
-        // 4: .rela.rodata
+        // 4: .rela.rodata or .rela.data.rel.ro
         appendShdr(output, .{ .sh_name = shname_rela_rodata, .sh_type = ELF.SHT_RELA, .sh_flags = ELF.SHF_INFO_LINK, .sh_offset = rela_rodata_offset, .sh_size = rela_rodata_size, .sh_link = SHIDX_SYMTAB, .sh_info = SHIDX_RODATA, .sh_addralign = 8, .sh_entsize = @sizeOf(Elf64_Rela) });
 
         // 5: .symtab
@@ -658,6 +668,20 @@ fn appendDebugRelocations(
         };
         output.appendSliceAssumeCapacity(std.mem.asBytes(&elf_rela));
     }
+}
+
+const ElfReadonlySection = struct {
+    name: []const u8,
+    relocation_name: []const u8,
+    flags: u64,
+};
+
+/// The section that holds the writer's constant data. See `ElfWriter.write`.
+fn elfReadonlySection(has_pointer_relocations: bool) ElfReadonlySection {
+    return if (has_pointer_relocations)
+        .{ .name = ".data.rel.ro", .relocation_name = ".rela.data.rel.ro", .flags = ELF.SHF_ALLOC | ELF.SHF_WRITE }
+    else
+        .{ .name = ".rodata", .relocation_name = ".rela.rodata", .flags = ELF.SHF_ALLOC };
 }
 
 fn alignUp(value: u64, alignment: u64) u64 {
@@ -759,4 +783,65 @@ test "DWARF relocations preserve target section and field width" {
     try std.testing.expectEqual(@as(i64, 32), text.r_addend);
     try std.testing.expectEqual(@as(u64, 40), line.r_offset);
     try std.testing.expectEqual((@as(u64, 2) << 32) | ELF.R_X86_64_32, line.r_info);
+}
+
+fn testSectionHeader(bytes: []const u8, index: u16) Elf64_Shdr {
+    const ehdr = std.mem.bytesToValue(Elf64_Ehdr, bytes[0..@sizeOf(Elf64_Ehdr)]);
+    const start: usize = @intCast(ehdr.e_shoff + @as(u64, index) * ehdr.e_shentsize);
+    return std.mem.bytesToValue(Elf64_Shdr, bytes[start..][0..@sizeOf(Elf64_Shdr)]);
+}
+
+fn testSectionName(bytes: []const u8, shdr: Elf64_Shdr) []const u8 {
+    const ehdr = std.mem.bytesToValue(Elf64_Ehdr, bytes[0..@sizeOf(Elf64_Ehdr)]);
+    const shstrtab = testSectionHeader(bytes, ehdr.e_shstrndx);
+    const start: usize = @intCast(shstrtab.sh_offset + shdr.sh_name);
+    return std.mem.sliceTo(bytes[start..], 0);
+}
+
+fn expectReadonlyDataSection(arch: Architecture, with_pointer: bool) (Allocator.Error || error{TestExpectedEqual})!void {
+    var writer = try ElfWriter.init(std.testing.allocator, arch, .none);
+    defer writer.deinit();
+
+    const data: [16]u8 = @splat(0);
+    writer.setRodata(&data);
+    const target_idx = try writer.addSymbol(.{
+        .name = "pointee",
+        .section = .rodata,
+        .offset = 8,
+        .size = 8,
+        .is_global = false,
+        .is_function = false,
+    });
+    if (with_pointer) try writer.addRodataRelocation(0, target_idx, 0);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try writer.write(&output);
+
+    const data_shdr = testSectionHeader(output.items, 2);
+    const rela_shdr = testSectionHeader(output.items, 4);
+    try std.testing.expectEqual(@as(u32, 2), rela_shdr.sh_info);
+    if (with_pointer) {
+        try std.testing.expectEqualStrings(".data.rel.ro", testSectionName(output.items, data_shdr));
+        try std.testing.expectEqual(@as(u64, ELF.SHF_ALLOC | ELF.SHF_WRITE), data_shdr.sh_flags);
+        try std.testing.expectEqualStrings(".rela.data.rel.ro", testSectionName(output.items, rela_shdr));
+        try std.testing.expectEqual(@as(u64, @sizeOf(Elf64_Rela)), rela_shdr.sh_size);
+    } else {
+        try std.testing.expectEqualStrings(".rodata", testSectionName(output.items, data_shdr));
+        try std.testing.expectEqual(@as(u64, ELF.SHF_ALLOC), data_shdr.sh_flags);
+        try std.testing.expectEqualStrings(".rela.rodata", testSectionName(output.items, rela_shdr));
+        try std.testing.expectEqual(@as(u64, 0), rela_shdr.sh_size);
+    }
+}
+
+test "constant data holding pointers is emitted into a relro section" {
+    // Shared libraries and PIE need a dynamic relocation per pointer, and
+    // ELF linkers reject those in a read-only section.
+    try expectReadonlyDataSection(.x86_64, true);
+    try expectReadonlyDataSection(.aarch64, true);
+}
+
+test "constant data without pointers stays in .rodata" {
+    try expectReadonlyDataSection(.x86_64, false);
+    try expectReadonlyDataSection(.aarch64, false);
 }

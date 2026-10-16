@@ -720,16 +720,23 @@ fn expectReadonlyObjectDataForTarget(target: RocTarget, required: []const u8, fo
         &output,
     );
 
-    const readonly = try readonlySection(target, output.items);
+    const readonly = try readonlySection(target, output.items, .no_pointers);
     try std.testing.expect(std.mem.find(u8, readonly, required) != null);
     try std.testing.expect(std.mem.find(u8, output.items, forbidden) == null);
 }
 
-fn readonlySection(target: RocTarget, object_bytes: []const u8) error{ UnsupportedTarget, InvalidObjectFile, SectionNotFound }![]const u8 {
+/// Whether an object's constant data contains pointers the linker relocates.
+/// ELF writes such data to `.data.rel.ro` instead of `.rodata`.
+const ConstantData = enum { no_pointers, holds_pointers };
+
+fn readonlySection(target: RocTarget, object_bytes: []const u8, data: ConstantData) error{ UnsupportedTarget, InvalidObjectFile, SectionNotFound }![]const u8 {
     return switch (roc_target.classifyOs(target.toOsTag())) {
         .macos => try machoSection(object_bytes, "__const"),
         .windows => try coffSectionData(object_bytes, ".rdata"),
-        .linux, .freebsd, .openbsd, .netbsd => try elfSectionData(object_bytes, ".rodata"),
+        .linux, .freebsd, .openbsd, .netbsd => try elfSectionData(object_bytes, switch (data) {
+            .no_pointers => ".rodata",
+            .holds_pointers => ".data.rel.ro",
+        }),
         .other => error.UnsupportedTarget,
     };
 }
@@ -1007,7 +1014,7 @@ test "indexed object relocations preserve targets through format symbol ordering
             try std.testing.expectEqual(@as(i64, 3), std.mem.readInt(i64, decoded.data[16..24], .little));
             try std.testing.expectEqual(@as(i64, if (target.toCpuArch() == .x86_64) -4 else 0), std.mem.readInt(i64, decoded.text[decoded.relocation_size + 16 ..][0..8], .little));
         } else {
-            const bytes = try readonlySection(target, output.items);
+            const bytes = try readonlySection(target, output.items, .holds_pointers);
             try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, bytes[0..8], .little));
         }
     }
@@ -1027,7 +1034,7 @@ const TestObjectTables = struct {
             .linux => return .{
                 .format = .elf,
                 .text = try elfSectionData(bytes, ".rela.text"),
-                .data = try elfSectionData(bytes, ".rela.rodata"),
+                .data = try elfSectionData(bytes, ".rela.data.rel.ro"),
                 .symbols = try elfSectionData(bytes, ".symtab"),
                 .strings = try elfSectionData(bytes, ".strtab"),
                 .relocation_size = 24,
@@ -1338,7 +1345,7 @@ fn exerciseBorrowedObjectSections(allocator: Allocator) (Allocator.Error || erro
         try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &data);
         try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &debug_line);
         try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &debug_info);
-        const section = try readonlySection(target, output.items);
+        const section = try readonlySection(target, output.items, .holds_pointers);
         const expected_addend: u64 = if (target.toOsTag() == .linux) 0 else 7;
         try std.testing.expectEqual(expected_addend, std.mem.readInt(u64, section[0..8], .little));
         if (target.toOsTag() == .windows) {
