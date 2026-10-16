@@ -137,7 +137,8 @@ pub fn main(init: std.process.Init) anyerror!void {
     }
 
     // The app sums an allocated 3-element list of n, doubles it via the hosted
-    // Host.double! function, and adds one: 6n + 1.
+    // Host.double! function, and adds the number of labels in its top-level
+    // constant that start with "another", which is one: 6n + 1.
     const answer = roc_run_app(20);
     if (answer != 121) {
         std.debug.print("FAILED: roc_run_app(20) returned {d}, expected 121\n", .{answer});
