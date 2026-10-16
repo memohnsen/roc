@@ -3634,6 +3634,22 @@ pub fn build(b: *std.Build) void {
         run_dylib_test.step.dependOn(&build_dylib_app.step);
         run_test_dylib_step.dependOn(&run_dylib_test.step);
 
+        // The dev backend writes its own object files, so its shared library
+        // goes through the same loader test.
+        const build_dev_dylib_app = b.addRunArtifact(roc_exe);
+        build_dev_dylib_app.addArgs(&.{
+            "build",
+            "--opt=dev",
+            b.fmt("--target={s}", .{output_target.roc_name}),
+        });
+        build_dev_dylib_app.addFileArg(dylib_sources.path(b, "test/dylib/app.roc"));
+        const dev_dylib_output = build_dev_dylib_app.addPrefixedOutputFileArg("--output=", b.fmt("app_dev{s}", .{dylib_ext}));
+
+        const run_dev_dylib_test = b.addRunArtifact(dylib_loader_exe);
+        run_dev_dylib_test.step.dependOn(&install_dylib_loader.step);
+        run_dev_dylib_test.addFileArg(dev_dylib_output);
+        run_test_dylib_step.dependOn(&run_dev_dylib_test.step);
+
         // Dead host code must be dead-code-eliminated while live host code
         // survives, checked by byte-scanning for marker data blobs (data works
         // on every object format, unlike symbol names—PE retains no internal
