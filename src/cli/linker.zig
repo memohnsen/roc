@@ -283,6 +283,54 @@ fn appendSharedLibraryExports(
     }
 }
 
+/// Make the export list the whole dynamic symbol table of an ELF shared
+/// library, as `-exported_symbol` does on Mach-O and `/export:` does on COFF.
+///
+/// An ELF linker exports every default-visibility definition in a shared
+/// library, and `--export-dynamic-symbol` only adds to that set, so without
+/// this the library would also export the compiler's builtins and every other
+/// support symbol linked into it. Those exports are interposable: the loader
+/// may bind the library's own calls to a same-named definition in another
+/// loaded object, such as a host that links a different Roc build. A version
+/// script that names the exports `global` and everything else `local` keeps
+/// them private and bound inside the library.
+fn appendElfSharedLibraryVersionScript(
+    ctx: *CliCtx,
+    args: *std.array_list.Managed([]const u8),
+    config: LinkConfig,
+) LinkError!void {
+    if (config.output_kind != .shared_lib or config.target_format != .elf) return;
+    if (config.export_symbols.len == 0) return;
+
+    const scratch_dir = config.scratch_dir orelse {
+        if (builtin.mode == .debug) {
+            base.invariant("linker invariant violated: an ELF shared library link has no scratch directory for its version script", .{});
+        }
+        unreachable;
+    };
+    const script = try elfExportVersionScript(ctx.arena, config.export_symbols);
+    const script_path = std.fs.path.join(ctx.arena, &.{ scratch_dir, "exports.map" }) catch return LinkError.OutOfMemory;
+    backend.writeFileWindowsAvSafe(ctx.io.std_io, script_path, script) catch return LinkError.LinkFailed;
+    const script_arg = std.fmt.allocPrint(ctx.arena, "--version-script={s}", .{script_path}) catch return LinkError.OutOfMemory;
+    try args.append(script_arg);
+}
+
+/// A version script whose `global` list is exactly `export_symbols`. Names
+/// are quoted so the linker matches them literally rather than as globs. A
+/// name containing a quote or line break cannot be written in a version
+/// script, so a host that exports one is rejected.
+fn elfExportVersionScript(allocator: std.mem.Allocator, export_symbols: []const []const u8) LinkError![]const u8 {
+    var script = std.ArrayList(u8).empty;
+    errdefer script.deinit(allocator);
+    script.appendSlice(allocator, "{\n  global:\n") catch return LinkError.OutOfMemory;
+    for (export_symbols) |symbol| {
+        if (std.mem.findAny(u8, symbol, "\"\r\n") != null) return LinkError.InvalidArguments;
+        script.print(allocator, "    \"{s}\";\n", .{symbol}) catch return LinkError.OutOfMemory;
+    }
+    script.appendSlice(allocator, "  local:\n    *;\n};\n") catch return LinkError.OutOfMemory;
+    return script.toOwnedSlice(allocator) catch return LinkError.OutOfMemory;
+}
+
 /// Errors that can occur during linking
 pub const LinkError = error{
     LinkFailed,
@@ -825,6 +873,7 @@ fn buildLinkArgs(ctx: *CliCtx, config: LinkConfig) LinkError!std.array_list.Mana
     // Force-include and export the host's declared exports from a shared
     // library. (wasm shared output uses --export via config.wasm_exports.)
     try appendSharedLibraryExports(ctx, &args, target_os, config.target_format, config.output_kind, config.export_symbols);
+    try appendElfSharedLibraryVersionScript(ctx, &args, config);
 
     // For WASM targets, wrap platform files in --whole-archive to include all symbols
     // This ensures host exports (init, handleEvent, update) aren't stripped even when
@@ -1418,6 +1467,53 @@ test "shared library exports use target linker spelling" {
     var exe_args = std.array_list.Managed([]const u8).init(ctx.arena);
     try appendSharedLibraryExports(&ctx, &exe_args, .windows, .coff, .exe, &.{"roc_run_app"});
     try std.testing.expectEqual(@as(?usize, null), findArg(exe_args.items, "/export:roc_run_app"));
+}
+
+test "ELF shared libraries export exactly their export list" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const scratch_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(scratch_dir);
+
+    var arena_instance = collections.SingleThreadArena.init(std.testing.allocator);
+    defer arena_instance.deinit();
+
+    var io = Io.create(std.testing.io);
+    var ctx = CliCtx.init(std.testing.allocator, arena_instance.allocator(), &io, .build);
+    ctx.initIo();
+    defer ctx.deinit();
+
+    const shared_config = LinkConfig{
+        .target_format = .elf,
+        .target_abi = .gnu,
+        .target_os = .linux,
+        .target_arch = .x86_64,
+        .output_path = "test_output",
+        .output_kind = .shared_lib,
+        .object_files = &.{"app.o"},
+        .export_symbols = &.{ "roc_t_init", "host_set_hooks" },
+        .scratch_dir = scratch_dir,
+    };
+    const shared_args = try buildLinkArgs(&ctx, shared_config);
+    const script_path = try std.fs.path.join(ctx.arena, &.{ scratch_dir, "exports.map" });
+    const script_arg = try std.fmt.allocPrint(ctx.arena, "--version-script={s}", .{script_path});
+    _ = findArg(shared_args.items, script_arg) orelse return error.MissingVersionScript;
+    const script = try tmp.dir.readFileAlloc(std.testing.io, "exports.map", ctx.arena, .limited(4096));
+    try std.testing.expectEqualStrings(
+        "{\n  global:\n    \"roc_t_init\";\n    \"host_set_hooks\";\n  local:\n    *;\n};\n",
+        script,
+    );
+
+    // An executable has no export list to enforce.
+    var exe_config = shared_config;
+    exe_config.output_kind = .exe;
+    const exe_args = try buildLinkArgs(&ctx, exe_config);
+    for (exe_args.items) |arg| try std.testing.expect(!std.mem.startsWith(u8, arg, "--version-script="));
+}
+
+test "ELF export version script rejects names it cannot quote" {
+    try std.testing.expectError(LinkError.InvalidArguments, elfExportVersionScript(std.testing.allocator, &.{"bad\"name"}));
+    try std.testing.expectError(LinkError.InvalidArguments, elfExportVersionScript(std.testing.allocator, &.{"bad\nname"}));
 }
 
 test "macOS platform archives use scoped force_load" {
