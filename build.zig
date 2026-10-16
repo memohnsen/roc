@@ -3651,6 +3651,28 @@ pub fn build(b: *std.Build) void {
         run_dev_dylib_test.addFileArg(dev_dylib_output);
         run_test_dylib_step.dependOn(&run_dev_dylib_test.step);
 
+        // An ELF linker exports every default-visibility definition unless
+        // told otherwise; check that each library exports exactly its
+        // declared interface. (Mach-O and COFF exports are an explicit list.)
+        if (output_target.resolved.result.ofmt == .elf) {
+            const dylib_export_check_exe = b.addExecutable(.{
+                .name = "dylib_export_check",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/dylib/export_check.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            configureBackend(dylib_export_check_exe, target);
+            build_test_dylib_step.dependOn(&dylib_export_check_exe.step);
+            for ([_]std.Build.LazyPath{ dylib_output, dev_dylib_output }) |output| {
+                const run_export_check = b.addRunArtifact(dylib_export_check_exe);
+                run_export_check.addFileArg(output);
+                run_export_check.addArgs(&.{ "roc_main", "roc_run_app" });
+                run_test_dylib_step.dependOn(&run_export_check.step);
+            }
+        }
+
         // Dead host code must be dead-code-eliminated while live host code
         // survives, checked by byte-scanning for marker data blobs (data works
         // on every object format, unlike symbol names—PE retains no internal
