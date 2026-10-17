@@ -614,6 +614,50 @@ pub fn extractPrepared(
         if (regionHasArtifact(region.kind)) artifact_count += 1;
     }
 
+    // Each unwind entry, reference, relocation and line entry belongs to at
+    // most one region. Index them by region once rather than rescanning every
+    // list for every region, which made extraction quadratic in the number of
+    // procedures: on a 25,000-procedure program it was most of the backend.
+    var frame_of_entry = std.AutoHashMapUnmanaged(usize, usize).empty;
+    defer frame_of_entry.deinit(allocator);
+    for (unwind, 0..) |function, unwind_index| {
+        const slot = try frame_of_entry.getOrPut(allocator, @intCast(function.start_offset));
+        // The first entry for an offset wins, as the linear search it replaces did.
+        if (!slot.found_existing) slot.value_ptr.* = unwind_index;
+    }
+
+    const region_of_ref = try allocator.alloc(?u32, refs.len);
+    defer allocator.free(region_of_ref);
+    for (refs, region_of_ref) |ref, *region_of| region_of.* = regionIndexOf(CG, regions, ref.site);
+    const ref_buckets = try RegionBuckets.init(allocator, regions.len, region_of_ref);
+    defer ref_buckets.deinit(allocator);
+
+    if (artifact_count != 0) {
+        for (relocations) |relocation| {
+            switch (relocation) {
+                .local_data, .jmp_to_return => return error.UnsupportedRelocation,
+                .retired, .linked_function, .linked_data => {},
+            }
+        }
+    }
+    const region_of_relocation = try allocator.alloc(?u32, relocations.len);
+    defer allocator.free(region_of_relocation);
+    for (relocations, region_of_relocation) |relocation, *region_of| region_of.* = switch (relocation) {
+        .linked_function, .linked_data => regionIndexOf(CG, regions, relocation.getOffset()),
+        // Retired ones carry nothing; the others were refused above whenever
+        // any region lifts into an artifact.
+        .retired, .local_data, .jmp_to_return => null,
+    };
+    const relocation_buckets = try RegionBuckets.init(allocator, regions.len, region_of_relocation);
+    defer relocation_buckets.deinit(allocator);
+
+    const line_entries = codegen.getLineEntries();
+    const region_of_line = try allocator.alloc(?u32, line_entries.len);
+    defer allocator.free(region_of_line);
+    for (line_entries, region_of_line) |line, *region_of| region_of.* = regionIndexOf(CG, regions, line.offset);
+    const line_buckets = try RegionBuckets.init(allocator, regions.len, region_of_line);
+    defer line_buckets.deinit(allocator);
+
     const artifacts = try arena_allocator.alloc(Artifact, artifact_count);
     for (regions, 0..) |region, region_index| {
         const index = artifact_of_region[region_index] orelse continue;
@@ -630,8 +674,8 @@ pub fn extractPrepared(
         };
 
         var frame: ?Frame = null;
-        for (unwind) |function| {
-            if (function.start_offset != region.start + region.entry) continue;
+        if (frame_of_entry.get(region.start + region.entry)) |unwind_index| {
+            const function = unwind[unwind_index];
             frame = .{
                 .prologue_size = function.prologue_size,
                 .stack_alloc = function.stack_alloc,
@@ -640,13 +684,13 @@ pub fn extractPrepared(
                 .epilogue_offset = function.epilogue_offset,
                 .uses_frame_pointer = function.uses_frame_pointer,
             };
-            break;
         }
 
         var region_refs = std.ArrayList(Reference).empty;
         var symbolic_refs = std.ArrayList(SymbolicReference).empty;
-        for (refs) |ref| {
-            if (ref.site < region.start or ref.site >= region.end) continue;
+        for (ref_buckets.of(region_index)) |ref_index| {
+            const ref = refs[ref_index];
+            std.debug.assert(ref.site >= region.start and ref.site < region.end);
             const symbolic_target: ?@FieldType(SymbolicReference, "target") = switch (ref.target) {
                 .proc => |proc_id| if (codegen.compiledProcSymbol(proc_id) == null) .{ .proc = proc_specs[@backingInt(proc_id)].identity } else null,
                 .rc_helper => |key| if (codegen.compiledRcHelperOffset(key) == null) .{ .rc_helper = try LirCodeGenMod.compiledRcHelperSymbolName(arena_allocator, layout_store, key) } else null,
@@ -689,14 +733,10 @@ pub fn extractPrepared(
         }
 
         var region_relocations = std.ArrayList(NamedRelocation).empty;
-        for (relocations) |relocation| {
-            switch (relocation) {
-                .retired => continue,
-                .local_data, .jmp_to_return => return error.UnsupportedRelocation,
-                .linked_function, .linked_data => {},
-            }
+        for (relocation_buckets.of(region_index)) |relocation_index| {
+            const relocation = relocations[relocation_index];
             const offset = relocation.getOffset();
-            if (offset < region.start or offset >= region.end) continue;
+            std.debug.assert(offset >= region.start and offset < region.end);
             try region_relocations.append(arena_allocator, switch (relocation) {
                 .linked_function => |function| .{
                     .offset = @intCast(offset - region.start),
@@ -719,8 +759,9 @@ pub fn extractPrepared(
         const region_data = try captureData(allocator, arena_allocator, region_relocations.items, &data_by_name, prepared);
 
         var lines = std.ArrayList(LineEntry).empty;
-        for (codegen.getLineEntries()) |line| {
-            if (line.offset < region.start or line.offset >= region.end) continue;
+        for (line_buckets.of(region_index)) |line_index| {
+            const line = line_entries[line_index];
+            std.debug.assert(line.offset >= region.start and line.offset < region.end);
             try lines.append(arena_allocator, .{ .offset = @intCast(line.offset - region.start), .loc = line.loc });
         }
         const artifact_code = try arena_allocator.dupe(u8, code[region.start..region.end]);
@@ -786,6 +827,55 @@ fn regionStartsBefore(comptime Region: type) fn (void, Region, Region) bool {
             return lhs.start < rhs.start;
         }
     }.lessThan;
+}
+
+/// Indices of a list's items grouped by the region holding each item, in the
+/// list's order within each region: region `r` owns
+/// `indices[starts[r]..starts[r + 1]]`. Items in no region are left out.
+const RegionBuckets = struct {
+    starts: []u32,
+    indices: []u32,
+
+    fn init(allocator: Allocator, region_count: usize, region_of_item: []const ?u32) Allocator.Error!RegionBuckets {
+        const starts = try allocator.alloc(u32, region_count + 1);
+        errdefer allocator.free(starts);
+        @memset(starts, 0);
+        var placed: u32 = 0;
+        for (region_of_item) |region_of| {
+            const region = region_of orelse continue;
+            starts[region + 1] += 1;
+            placed += 1;
+        }
+        for (1..starts.len) |index| starts[index] += starts[index - 1];
+        std.debug.assert(starts[region_count] == placed);
+
+        const indices = try allocator.alloc(u32, placed);
+        errdefer allocator.free(indices);
+        // `starts[r]` doubles as region r's write cursor, then is shifted back.
+        for (region_of_item, 0..) |region_of, item_index| {
+            const region = region_of orelse continue;
+            indices[starts[region]] = @intCast(item_index);
+            starts[region] += 1;
+        }
+        var index = region_count;
+        while (index > 0) : (index -= 1) starts[index] = starts[index - 1];
+        starts[0] = 0;
+        return .{ .starts = starts, .indices = indices };
+    }
+
+    fn of(self: RegionBuckets, region: usize) []const u32 {
+        return self.indices[self.starts[region]..self.starts[region + 1]];
+    }
+
+    fn deinit(self: RegionBuckets, allocator: Allocator) void {
+        allocator.free(self.indices);
+        allocator.free(self.starts);
+    }
+};
+
+fn regionIndexOf(comptime CG: type, regions: []const CG.CodeRegion, offset: usize) ?u32 {
+    const index = regionContaining(CG, regions, offset) orelse return null;
+    return @intCast(index);
 }
 
 fn regionContaining(comptime CG: type, regions: []const CG.CodeRegion, offset: usize) ?usize {
@@ -1525,4 +1615,25 @@ test "constants are named by content across programs, through cycles, and never 
     // The leaf's program-local name is the same in both programs, and its
     // content name is not.
     try testing.expect(!std.mem.eql(u8, one_leaf, names_three.of("roc__d0_2")));
+}
+
+test "RegionBuckets groups items by region in list order" {
+    const allocator = std.testing.allocator;
+    const region_of_item = [_]?u32{ 2, 0, null, 2, 1, 0, null, 2 };
+    const buckets = try RegionBuckets.init(allocator, 4, &region_of_item);
+    defer buckets.deinit(allocator);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, buckets.of(0));
+    try std.testing.expectEqualSlices(u32, &.{4}, buckets.of(1));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 7 }, buckets.of(2));
+    try std.testing.expectEqualSlices(u32, &.{}, buckets.of(3));
+}
+
+test "RegionBuckets with no regions or no items" {
+    const allocator = std.testing.allocator;
+    const none = try RegionBuckets.init(allocator, 0, &.{ null, null });
+    defer none.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), none.indices.len);
+    const empty = try RegionBuckets.init(allocator, 3, &.{});
+    defer empty.deinit(allocator);
+    try std.testing.expectEqualSlices(u32, &.{}, empty.of(1));
 }
