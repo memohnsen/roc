@@ -2470,15 +2470,33 @@ const Pass = struct {
     }
 
     fn reserveSpecIds(self: *Pass) Allocator.Error!void {
+        // Digest every pattern before adding any placeholder. A digest that
+        // names a callable asks for platform-requirement reachability
+        // (`Program.fnReachesPlatformRequirement`), which walks the whole
+        // program again whenever a function was added since it last ran, so
+        // digesting between additions walked it once per specialization. A
+        // placeholder's body is hosted, so it references nothing and no
+        // existing function can reach a requirement through it: every digest
+        // comes out the same either way.
+        var digests = std.ArrayList(names.TypeDigest).empty;
+        defer digests.deinit(self.allocator);
+        for (self.plans) |*plan| {
+            for (plan.specs.items) |*spec| {
+                try digests.append(self.allocator, try patternDigest(self.program, spec.pattern));
+            }
+        }
+        var next_digest: usize = 0;
         for (self.plans, 0..) |*plan, source_index| {
             const source_fn = self.program.getFnAt(source_index);
             for (plan.specs.items) |*spec| {
+                const digest = digests.items[next_digest];
+                next_digest += 1;
                 const symbol = self.symbols.fresh();
                 const fn_id = try self.program.addFn(.{
                     .symbol = symbol,
                     .source = source_fn.source,
                     .root_identity = source_fn.root_identity,
-                    .spec_constr_pattern = try patternDigest(self.program, spec.pattern),
+                    .spec_constr_pattern = digest,
                     .args = .empty(),
                     .captures = source_fn.captures,
                     .body = .hosted,
