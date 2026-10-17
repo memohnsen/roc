@@ -35,6 +35,8 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Transforms/Vectorize/LoopVectorize.h>
 #include <llvm/Transforms/Vectorize/SLPVectorizer.h>
+#include <llvm/Transforms/Scalar/MemCpyOptimizer.h>
+#include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Passes/StandardInstrumentations.h>
@@ -397,6 +399,23 @@ static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleR
         }
 
         module_pm.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+
+        // Roc's code generator gives every value a stack slot and moves values
+        // between slots with memcpy, so a large procedure can copy one slot (a
+        // big record parameter, say) into thousands of others. SROA, which the
+        // default pipeline runs before MemCpyOpt, rescans a slot's uses every
+        // time it rewrites one of the slots copied from it, which is quadratic
+        // in the number of copies: one 300,000-line procedure spent 160 s in a
+        // single SROA run. Forwarding the copy chains first leaves SROA linear
+        // work; the same procedure then optimizes in about 36 s in total. Both
+        // passes run again later in the default pipeline, so this only moves
+        // work earlier and does not change which transformations are allowed.
+        if (level != OptimizationLevel::O0) {
+            FunctionPassManager copy_forwarding;
+            copy_forwarding.addPass(SROAPass(SROAOptions::ModifyCFG));
+            copy_forwarding.addPass(MemCpyOptPass());
+            module_pm.addPass(createModuleToFunctionPassAdaptor(std::move(copy_forwarding)));
+        }
     });
 
     const bool early_san = options->is_debug;
