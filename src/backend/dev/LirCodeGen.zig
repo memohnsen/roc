@@ -1595,7 +1595,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             const root_proc = try self.compiledProcForId(root_proc_id);
-            const final_result = try self.generateCallToCompiledProc(root_proc, &.{}, &.{}, result_layout, null);
+            const final_result = try self.generateCallToCompiledProc(root_proc, &.{}, &.{}, result_layout, null, null);
             const actual_ret_layout = result_layout;
 
             // If the root never returns, the trap path has already been emitted and
@@ -8273,6 +8273,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         ) Allocator.Error!void {
             const normalized = self.coerceImmediateToLayout(value_loc, layout_idx);
             if (std.meta.eql(normalized, stable_loc)) return;
+            // The value already occupies the stable slot's bytes (a field stored
+            // inside its struct, or a value built in place).
+            if (frameOffsetOf(normalized)) |from| if (frameOffsetOf(stable_loc)) |to| if (from == to) return;
 
             const size = self.getLayoutSize(layout_idx);
             if (size == 0) return;
@@ -8427,6 +8430,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             else
                 self.stackLocationForLayout(local_layout, self.codegen.allocStackSlot(size));
             try self.setLocalLocation(key, stable_loc);
+        }
+
+        /// The frame offset of a stack-held value, or null.
+        fn frameOffsetOf(loc: ValueLocation) ?i32 {
+            return switch (loc) {
+                .stack => |stack_loc| stack_loc.offset,
+                inline .stack_i128, .stack_str => |offset| offset,
+                .list_stack => |list_loc| list_loc.struct_offset,
+                .general_reg, .float_reg, .vector_reg, .immediate_i64, .immediate_f32, .immediate_f64, .immediate_i128, .noreturn => null,
+            };
         }
 
         fn stableLocationStackOffset(stable_loc: ValueLocation) i32 {
@@ -8777,20 +8790,34 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
             // Preserve immutable aliases as one storage identity. All other
             // values retain independent bindings, even if their dead lifetimes
-            // subsequently permit the same physical slot.
+            // subsequently permit the same physical slot. A field projected
+            // out of an immutable struct is such an alias too: it is stored in
+            // the struct's own bytes, at the field's offset (`alias_links`),
+            // so reading a field copies nothing. Its uses keep the struct's
+            // bytes live for as long as the field is.
+            const alias_links = try self.allocator.alloc(?AliasLink, plan.values.items.len);
+            defer self.allocator.free(alias_links);
+            @memset(alias_links, null);
             for (work.items) |id| {
                 const stmt = self.store.getCFStmt(id);
-                if (stmt != .assign_ref or stmt.assign_ref.op != .local) continue;
+                if (stmt != .assign_ref) continue;
                 const assign = stmt.assign_ref;
+                const source_local: LocalId, const offset: u32 = switch (assign.op) {
+                    .local => |local| .{ local, 0 },
+                    .nominal => |nominal| .{ nominal.backing_ref, 0 },
+                    .field => |field| if (bisect_field_alias or bisectEnvInt("ROC_DEV_FIELD_ALIAS", 0) == 1) .{ field.source, self.projectedFieldOffset(field.source, field.field_idx, assign.target) orelse continue } else continue,
+                    else => continue,
+                };
                 const target_index = plan.localIndex(assign.target).?;
-                const source = plan.localIndex(assign.op.local).?;
+                const source = plan.localIndex(source_local).?;
                 const t = plan.values.items[target_index];
                 const s = plan.values.items[source];
                 if (t.definitions != 1 or s.definitions > 1 or t.mutable or s.mutable) continue;
                 const rep = self.runtimeRepresentationLayoutIdx(self.localLayout(assign.target));
-                if (rep != self.runtimeRepresentationLayoutIdx(self.localLayout(assign.op.local))) continue;
+                if (assign.op != .field and rep != self.runtimeRepresentationLayoutIdx(self.localLayout(source_local))) continue;
                 if (rep == .f32 or rep == .f64 or self.simdKindForLayout(rep) != null) continue;
                 plan.values.items[target_index].representative = source;
+                alias_links[target_index] = .{ .parent = source, .offset = offset };
             }
             for (plan.values.items, 0..) |v, i| {
                 const root_index = plan.representative(@intCast(i));
@@ -8815,8 +8842,51 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
             for (plan.values.items, 0..) |v, i| {
                 const rep = plan.representative(@intCast(i));
-                if (rep != i) try self.setLocalLocation(localKey(v.local), self.local_locations.get(localKey(plan.values.items[rep].local)).?);
+                if (rep == i) continue;
+                const root_loc = self.local_locations.get(localKey(plan.values.items[rep].local)).?;
+                var offset: u32 = 0;
+                var link = alias_links[i];
+                while (link) |l| : (link = alias_links[l.parent]) offset += l.offset;
+                if (offset == 0) {
+                    try self.setLocalLocation(localKey(v.local), root_loc);
+                } else {
+                    // Only a struct of represented bytes projects a field, so
+                    // its root is a plain stack slot.
+                    const root_offset = frameOffsetOf(root_loc) orelse unreachable;
+                    try self.setLocalLocation(localKey(v.local), self.stackLocationForLayout(self.localLayout(v.local), root_offset + @as(i32, @intCast(offset))));
+                }
             }
+        }
+
+        const AliasLink = struct { parent: u32, offset: u32 };
+
+        // TEMPORARY bisect knobs (remove before merging).
+        fn bisectEnvInt(name: [*:0]const u8, default: u64) u64 {
+            const raw = std.c.getenv(name) orelse return default;
+            return std.fmt.parseInt(u64, std.mem.span(raw), 10) catch default;
+        }
+        fn bisectWideAllowed(size: u32) bool {
+            const blocks = size / 32;
+            const mode = bisectEnvInt("ROC_DEV_WIDE_MODE", 3); // bit0 unrolled, bit1 loop
+            if (blocks <= max_unrolled_copy_blocks and mode & 1 == 0) return false;
+            if (blocks > max_unrolled_copy_blocks and mode & 2 == 0) return false;
+            return size >= bisectEnvInt("ROC_DEV_WIDE_MIN", 0) and size <= bisectEnvInt("ROC_DEV_WIDE_MAX", std.math.maxInt(u32));
+        }
+        const bisect_field_alias = false;
+        const bisect_direct = true;
+        const bisect_copy_wide = true;
+
+        /// The byte offset of field `field_idx` in `source`, when `target`
+        /// can be stored inside `source`'s own bytes: `source` is a struct held
+        /// inline (not boxed) and the field has represented bytes.
+        fn projectedFieldOffset(self: *Self, source: LocalId, field_idx: u32, target_local: LocalId) ?u32 {
+            const ls = self.layout_store;
+            const source_layout = ls.getLayout(self.localLayout(source));
+            if (source_layout.tag != .struct_) return null;
+            const struct_idx = source_layout.getStruct().idx;
+            if (ls.getStructFieldSizeByOriginalIndex(struct_idx, field_idx) == 0) return null;
+            if (self.getLayoutSize(self.localLayout(target_local)) == 0) return null;
+            return ls.getStructFieldOffsetByOriginalIndex(struct_idx, field_idx);
         }
 
         fn generateRefOp(self: *Self, op: lir.RefOp, target_layout: layout.Idx) Allocator.Error!ValueLocation {
@@ -13614,7 +13684,58 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             };
         }
 
-        fn generateStruct(self: *Self, s: anytype) Allocator.Error!ValueLocation {
+        /// Where an aggregate statement may build its value: the target's own
+        /// stable slot, when no other local the statement reads or defines
+        /// occupies any of its bytes. Building there saves copying the finished
+        /// value out of a scratch slot. The stack plan may give the target a
+        /// slot it shares with an operand whose lifetime ends at this
+        /// statement, or with another definition that is never read; a value
+        /// built in place would overwrite the one or be overwritten by the
+        /// other, so any overlap keeps the scratch slot.
+        fn directResultOffset(self: *Self, stmt: lir.LIR.CFStmt, target_local: LocalId) ?i32 {
+            if (!bisect_direct) return null;
+            const loc = self.local_locations.get(localKey(target_local)) orelse return null;
+            if (loc != .stack) return null;
+            const size = self.getLayoutSize(self.localLayout(target_local));
+            if (size == 0) return null;
+            var check = OperandOverlap{ .owner = self, .target = target_local, .start = loc.stack.offset, .end = loc.stack.offset + @as(i32, @intCast(size)) };
+            lir.BodyClone.forEachStmtRead(self.store, stmt, &check, OperandOverlap.noteRead);
+            lir.BodyClone.forEachStmtDef(self.store, stmt, &check, OperandOverlap.noteDef);
+            return if (check.overlaps) null else loc.stack.offset;
+        }
+
+        const OperandOverlap = struct {
+            owner: *Self,
+            target: LocalId,
+            start: i32,
+            end: i32,
+            overlaps: bool = false,
+
+            /// A read of the target itself overlaps it too.
+            fn noteRead(check: *@This(), local: LocalId) void {
+                check.note(local);
+            }
+
+            fn noteDef(check: *@This(), local: LocalId) void {
+                if (local != check.target) check.note(local);
+            }
+
+            fn note(check: *@This(), local: LocalId) void {
+                const loc = check.owner.local_locations.get(localKey(local)) orelse return;
+                const offset: i32 = switch (loc) {
+                    .stack => |stack_loc| stack_loc.offset,
+                    inline .stack_i128, .stack_str => |offset| offset,
+                    .list_stack => |list_loc| list_loc.struct_offset,
+                    .general_reg, .float_reg, .vector_reg, .immediate_i64, .immediate_f32, .immediate_f64, .immediate_i128, .noreturn => return,
+                };
+                const size: i32 = @intCast(@max(check.owner.getLayoutSize(check.owner.localLayout(local)), 1));
+                if (offset < check.end and check.start < offset + size) check.overlaps = true;
+            }
+        };
+
+        /// `dest`, when set, is the frame offset to build a runtime struct at
+        /// (see `directResultOffset`); otherwise it is built in a scratch slot.
+        fn generateStruct(self: *Self, s: anytype, dest: ?i32) Allocator.Error!ValueLocation {
             const ls = self.layout_store;
             const target_layout = ls.getLayout(s.target_layout);
             switch (target_layout.tag) {
@@ -13678,7 +13799,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         return .{ .immediate_i64 = 0 };
                     }
 
-                    const base_offset = self.codegen.allocStackSlot(stack_size);
+                    const base_offset = dest orelse self.codegen.allocStackSlot(stack_size);
                     const field_exprs = self.store.getLocalSpan(s.fields);
 
                     for (0..field_exprs.len) |i| {
@@ -13725,7 +13846,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
         }
 
-        fn generateTag(self: *Self, tag: anytype) Allocator.Error!ValueLocation {
+        /// `dest`, when set, is the frame offset to build a stack tag union at
+        /// (see `directResultOffset`); otherwise it is built in a scratch slot.
+        fn generateTag(self: *Self, tag: anytype, dest: ?i32) Allocator.Error!ValueLocation {
             const ls = self.layout_store;
             const union_layout = ls.getLayout(tag.target_layout);
             if (union_layout.tag == .zst) {
@@ -13841,7 +13964,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const variant_payload_layout = variants.get(tag.variant_index).payload_layout;
 
             if (tag.payload == null) {
-                const base_offset = self.codegen.allocStackSlot(stack_size);
+                const base_offset = dest orelse self.codegen.allocStackSlot(stack_size);
                 try self.zeroStackArea(base_offset, stack_size);
 
                 const disc_offset = tu_data.discriminant_offset.get(self.layout_store.targetUsize());
@@ -13850,7 +13973,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
                 return self.stackLocationForLayout(tag.target_layout, base_offset);
             } else if (tag.payload) |payload_local| {
-                const base_offset = self.codegen.allocStackSlot(stack_size);
+                const base_offset = dest orelse self.codegen.allocStackSlot(stack_size);
                 try self.zeroStackArea(base_offset, stack_size);
 
                 const arg_loc = try self.coerceRefLocalValueToLayout(
@@ -13953,7 +14076,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
 
             const proc = try self.compiledProcForId(call.proc);
-            return try self.generateCallToCompiledProc(proc, arg_locs, arg_layouts, call.ret_layout, call.out_desc);
+            return try self.generateCallToCompiledProc(proc, arg_locs, arg_layouts, call.ret_layout, call.out_desc, call.ret_dest);
         }
 
         /// Replace this procedure's frame with a call to `call.proc`, whose
@@ -15101,6 +15224,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             arg_layouts: []const layout.Idx,
             ret_layout: layout.Idx,
             out_desc: ?LocalId,
+            /// Where a result returned through a pointer is written, when the
+            /// caller has a slot no argument occupies (`directResultOffset`).
+            ret_dest: ?i32,
         ) Allocator.Error!ValueLocation {
             std.debug.assert(args.len == arg_layouts.len);
             const has_runtime_ret_desc = self.store.getProcSpecImmediate(proc.id).runtime_ret_desc != null;
@@ -15111,7 +15237,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 );
             }
             const needs_ret_ptr = self.needsInternalReturnByPointer(ret_layout);
-            const ret_buffer_offset = if (needs_ret_ptr) blk: {
+            const ret_buffer_offset = if (needs_ret_ptr) ret_dest orelse blk: {
                 const runtime_ret_layout = self.runtimeRepresentationLayoutIdx(ret_layout);
                 const size = self.layout_store.layoutSizeAlign(self.layout_store.getLayout(runtime_ret_layout)).size;
                 break :blk self.codegen.allocStackSlot(size);
@@ -17625,9 +17751,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// to general registers.
         fn copyWide(self: *Self, temp_reg: GeneralReg, src_base: GeneralReg, src_offset: i32, dst_base: GeneralReg, dst_offset: i32, size: u32) Allocator.Error!bool {
             std.debug.assert(size > 32);
-            const v0 = self.codegen.allocFloat() orelse return false;
+            if (!bisect_copy_wide) return false;
+            if (!bisectWideAllowed(size)) return false;
+            const v0 = self.allocCopyVector() orelse return false;
             defer self.codegen.freeFloat(v0);
-            const v1 = self.codegen.allocFloat() orelse return false;
+            const v1 = self.allocCopyVector() orelse return false;
             defer self.codegen.freeFloat(v1);
             const src = try self.allocTempGeneral();
             defer self.codegen.freeGeneral(src);
@@ -17665,9 +17793,34 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 try self.emitVectorMove(.store, v0, dst, tail);
                 tail += 16;
             }
-            // Fewer than 16 bytes remain: general registers copy them exactly.
-            try self.copyChunked(temp_reg, src, tail, dst, tail, size % 16);
+            // Fewer than 16 bytes remain. As in `copyLoop`, a whole word goes
+            // first and only the last partial word re-reads bytes, so a copy to
+            // a lower address that overlaps its source reads nothing it wrote.
+            if (size % 16 >= 8) {
+                try self.emitLoad(.w64, temp_reg, src, tail);
+                try self.emitStore(.w64, dst, tail, temp_reg);
+                tail += 8;
+            }
+            try self.copyChunked(temp_reg, src, tail, dst, tail, size % 8);
             return true;
+        }
+
+        /// Vector registers a copy may borrow: caller-saved and never an
+        /// argument or return register. Copies run while the ABI still holds
+        /// values the register pool does not track, such as incoming float
+        /// arguments while parameters are bound, so the argument and return
+        /// registers are never borrowed even when the pool reports them free.
+        const copy_vector_mask: u32 = switch (arch) {
+            .x86_64 => if (target.isWindows()) 0x30 else 0xFF00, // XMM4-5; XMM8-15
+            else => 0xFFFF0000, // V16-V31
+        };
+
+        fn allocCopyVector(self: *Self) ?FloatReg {
+            const candidates = self.codegen.free_float & copy_vector_mask;
+            if (candidates == 0) return null;
+            const index: u5 = @intCast(@ctz(candidates));
+            self.codegen.free_float &= ~(@as(u32, 1) << index);
+            return @fromBackingInt(@intCast(index));
         }
 
         const VectorAccess = enum { load, store };
@@ -20373,6 +20526,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .args = assign.args,
                                 .ret_layout = self.localLayout(assign.target),
                                 .out_desc = assign.out_desc,
+                                .ret_dest = self.directResultOffset(stmt, assign.target),
                             });
                             const driven_loc = try self.emitDrivePending(assign.drive, value_loc, self.localLayout(assign.target), assign.result_desc, assign.out_desc);
                             try self.bindCallResult(assign.target, driven_loc, assign.drive);
@@ -20503,7 +20657,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .fields = assign.fields,
                                 .target = assign.target,
                                 .target_layout = self.localLayout(assign.target),
-                            });
+                            }, self.directResultOffset(stmt, assign.target));
                             try self.bindAssignedLocal(assign.target, value_loc);
                             try work.append(wa, .{ .node = assign.next });
                         },
@@ -20514,7 +20668,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .variant_index = assign.variant_index,
                                 .discriminant = assign.discriminant,
                                 .payload = assign.payload,
-                            });
+                            }, self.directResultOffset(stmt, assign.target));
                             try self.bindAssignedLocal(assign.target, value_loc);
                             try work.append(wa, .{ .node = assign.next });
                         },
@@ -20524,7 +20678,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .fields = assign.fields,
                                 .target = assign.dest,
                                 .target_layout = assign.struct_layout,
-                            });
+                            }, null);
                             try self.copyValueToPointer(value_loc, assign.struct_layout, assign.dest);
                             try work.append(wa, .{ .node = assign.next });
                         },
@@ -20535,7 +20689,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                 .variant_index = assign.variant_index,
                                 .discriminant = assign.discriminant,
                                 .payload = assign.payload,
-                            });
+                            }, null);
                             try self.copyValueToPointer(value_loc, assign.tag_layout, assign.dest);
                             try work.append(wa, .{ .node = assign.next });
                         },
