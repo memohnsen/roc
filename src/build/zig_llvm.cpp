@@ -70,6 +70,8 @@
 #include <llvm/Transforms/Utils/LowerMemIntrinsics.h>
 #include <llvm/Transforms/Utils/NameAnonGlobals.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Linker/Linker.h>
+#include <llvm/Transforms/Scalar/EarlyCSE.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -85,6 +87,7 @@
 #endif
 
 #include <algorithm>
+#include <functional>
 #include <atomic>
 #include <mutex>
 #include <new>
@@ -604,22 +607,23 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitObjectToMemory(LLVMTargetMachineRef ta
 //
 // Roc gives LLVM the whole program as one module, and LLVM optimizes and code-generates a
 // module on one thread, so an optimized build of a large app (the 7,654-function Atlas
-// desktop UI) spent about 12 minutes on one core. Like rustc's codegen units, this splits
-// the module into parts that are optimized and code-generated independently, each in its
-// own LLVMContext on its own thread, and written to its own object file.
-//
-// Splitting changes what the optimizer can see, so the split keeps the inlining that
-// matters:
-//  - A local function with a single caller (most of Roc's lambda-lifted procedures) stays
-//    in its caller's part, so the inliner still sees its only call site. A part is capped at
-//    half the average part size so one call tree cannot take most of the program.
-//  - Functions marked `alwaysinline` and constant globals referenced from another part are
-//    copied into the referencing part as `available_externally`: the optimizer may inline or
-//    fold them, and drops the copy afterwards, so each still has one definition.
-//  - Every other reference across parts becomes a call to (or load of) a hidden symbol.
-//    Locals that need one are renamed with a suffix unique to the module, so they cannot
-//    collide with another object's symbols at link time.
-// The plan depends only on the module, never on the thread count, so the objects are the
+// desktop UI) spent about 12 minutes on one core. Splitting the module before the optimizer
+// runs costs too much runtime: Roc marks every procedure `inlinehint` and depends on LLVM
+// inlining small procedures into their many callers, which a part boundary stops (the UI's
+// Roc code ran 2.5x slower with 13 parts). So the inliner and the rest of the optimization
+// pipeline still see the whole module, and only work that is local to each function runs in
+// parallel:
+//  1. Before the pipeline, each part of the module gets the function-local cleanup that the
+//     pipeline would otherwise start with (Roc's copy forwarding, SROA, CSE, InstCombine,
+//     SimplifyCFG). Roc's IR moves every value through stack slots, so this shrinks it a lot
+//     and makes the serial pipeline much cheaper. The parts are linked back into one module.
+//  2. The whole-module pipeline runs on one thread, as before.
+//  3. The optimized module is split again and each part is code-generated into its own
+//     object file.
+// Each part runs in its own LLVMContext on its own thread. Locals referenced across parts
+// become hidden symbols with a module-unique suffix, so they cannot collide with another
+// object's symbols at link time; step 1 makes them local again when it links the parts back.
+// The parts depend only on the module, never on the thread count, so the objects are the
 // same for any number of workers.
 namespace {
 
@@ -659,16 +663,15 @@ bool moduleCanBePartitioned(const Module &module) {
     return true;
 }
 
+// Which part owns each definition. Locals referenced from another part are renamed and made
+// hidden external symbols; their new names are appended to `renamed`.
 struct PartitionPlan {
     std::vector<GlobalValue *> defs;
     std::vector<unsigned> owner;
-    std::vector<std::vector<unsigned>> imports;
-    unsigned partition_count = 1;
 };
 
-PartitionPlan planPartitions(Module &module, unsigned partition_count) {
+PartitionPlan planPartitions(Module &module, unsigned partition_count, std::vector<std::string> &renamed) {
     PartitionPlan plan;
-    plan.partition_count = partition_count;
     DenseMap<const GlobalValue *, unsigned> index;
     for (GlobalValue &gv : module.global_values()) {
         if (gv.isDeclaration()) continue;
@@ -697,7 +700,8 @@ PartitionPlan planPartitions(Module &module, unsigned partition_count) {
         }
     }
 
-    // Clusters that must or should share a part.
+    // Keep a local with a single user in its user's part, so it stays local, capped at half
+    // the average part so one call tree cannot unbalance the parts.
     std::vector<unsigned> parent(def_count);
     std::iota(parent.begin(), parent.end(), 0u);
     auto find = [&](unsigned x) {
@@ -714,32 +718,33 @@ PartitionPlan planPartitions(Module &module, unsigned partition_count) {
         total_size += own_size[i];
     }
     std::vector<uint64_t> cluster_size = own_size;
-    auto unite = [&](unsigned a, unsigned b) {
-        a = find(a);
-        b = find(b);
-        if (a == b) return;
-        parent[a] = b;
-        cluster_size[b] += cluster_size[a];
-    };
-    std::vector<unsigned> single_caller;
+    const uint64_t cluster_cap = std::max<uint64_t>(1, total_size / partition_count / 2);
+    std::vector<unsigned> single_user;
     for (unsigned i = 0; i < def_count; i++) {
         GlobalValue *gv = plan.defs[i];
         if (isa<GlobalAlias>(gv)) {
-            for (unsigned ref : refs[i]) unite(i, ref);
-        } else if (isa<GlobalVariable>(gv)) {
-            if (users[i].size() == 1) unite(i, users[i][0]);
-        } else if (gv->hasLocalLinkage() && users[i].size() == 1 && isa<Function>(plan.defs[users[i][0]])) {
-            single_caller.push_back(i);
+            // An alias and its aliasee must share a part.
+            for (unsigned ref : refs[i]) {
+                unsigned a = find(i), b = find(ref);
+                if (a != b) {
+                    parent[a] = b;
+                    cluster_size[b] += cluster_size[a];
+                }
+            }
+        } else if (gv->hasLocalLinkage() && users[i].size() == 1) {
+            single_user.push_back(i);
         }
     }
-    // Smallest callees first, so a capped cluster keeps its many small helpers and leaves
-    // out a few large subtrees.
-    const uint64_t cluster_cap = std::max<uint64_t>(1, total_size / partition_count / 2);
-    std::stable_sort(single_caller.begin(), single_caller.end(),
+    // Smallest first, so a capped cluster keeps many small helpers and leaves out a few
+    // large subtrees.
+    std::stable_sort(single_user.begin(), single_user.end(),
                      [&](unsigned a, unsigned b) { return own_size[a] < own_size[b]; });
-    for (unsigned callee : single_caller) {
-        unsigned a = find(callee), b = find(users[callee][0]);
-        if (a != b && cluster_size[a] + cluster_size[b] <= cluster_cap) unite(a, b);
+    for (unsigned def : single_user) {
+        unsigned a = find(def), b = find(users[def][0]);
+        if (a != b && cluster_size[a] + cluster_size[b] <= cluster_cap) {
+            parent[a] = b;
+            cluster_size[b] += cluster_size[a];
+        }
     }
 
     // Largest cluster first onto the least loaded part; ties keep definition order, so the
@@ -763,43 +768,12 @@ PartitionPlan planPartitions(Module &module, unsigned partition_count) {
     plan.owner.resize(def_count);
     for (unsigned i = 0; i < def_count; i++) plan.owner[i] = root_partition[find(i)];
 
-    // Copies of `alwaysinline` functions and constants that each part references.
-    plan.imports.resize(partition_count);
-    std::vector<unsigned> imported_into(def_count, UINT32_MAX);
-    for (unsigned p = 0; p < partition_count; p++) {
-        SmallVector<unsigned, 256> work;
-        for (unsigned i = 0; i < def_count; i++) {
-            if (plan.owner[i] == p) work.append(refs[i].begin(), refs[i].end());
-        }
-        while (!work.empty()) {
-            unsigned ref = work.pop_back_val();
-            if (plan.owner[ref] == p || imported_into[ref] == p) continue;
-            GlobalValue *gv = plan.defs[ref];
-            bool importable = false;
-            if (auto *f = dyn_cast<Function>(gv)) {
-                importable = f->hasFnAttribute(Attribute::AlwaysInline) && !f->isInterposable();
-            } else if (auto *var = dyn_cast<GlobalVariable>(gv)) {
-                importable = var->isConstant() && var->hasInitializer() && !var->isInterposable();
-            }
-            if (!importable) continue;
-            imported_into[ref] = p;
-            plan.imports[p].push_back(ref);
-            work.append(refs[ref].begin(), refs[ref].end());
-        }
-    }
-
     // Locals referenced from another part need a symbol.
     std::vector<bool> needs_symbol(def_count, false);
-    for (unsigned p = 0; p < partition_count; p++) {
-        auto mark = [&](unsigned def) {
-            for (unsigned ref : refs[def]) {
-                if (plan.owner[ref] != p) needs_symbol[ref] = true;
-            }
-        };
-        for (unsigned i = 0; i < def_count; i++) {
-            if (plan.owner[i] == p) mark(i);
+    for (unsigned i = 0; i < def_count; i++) {
+        for (unsigned ref : refs[i]) {
+            if (plan.owner[ref] != plan.owner[i]) needs_symbol[ref] = true;
         }
-        for (unsigned def : plan.imports[p]) mark(def);
     }
     uint64_t module_hash = 0xcbf29ce484222325ull;
     for (GlobalValue *gv : plan.defs) {
@@ -810,33 +784,36 @@ PartitionPlan planPartitions(Module &module, unsigned partition_count) {
     for (unsigned i = 0; i < def_count; i++) {
         GlobalValue *gv = plan.defs[i];
         if (!needs_symbol[i] || !gv->hasLocalLinkage()) continue;
-        std::string name = (gv->hasName() ? gv->getName().str() : "anon." + std::to_string(i)) + suffix;
-        gv->setName(name);
+        gv->setName((gv->hasName() ? gv->getName().str() : "anon." + std::to_string(i)) + suffix);
         gv->setLinkage(GlobalValue::ExternalLinkage);
         gv->setVisibility(GlobalValue::HiddenVisibility);
+        renamed.push_back(gv->getName().str());
     }
     return plan;
 }
 
-// Part `p` of `module` as bitcode: its own definitions, imported copies as
-// `available_externally`, and declarations of everything else it references.
+// Part `p` of `module` as bitcode: its own definitions, and declarations of everything else
+// it references.
 void writePartitionBitcode(const Module &module, const PartitionPlan &plan, unsigned p,
                            SmallVectorImpl<char> &out) {
-    DenseMap<const GlobalValue *, unsigned> wanted;
+    DenseSet<const GlobalValue *> owned;
     for (unsigned i = 0; i < plan.defs.size(); i++) {
-        if (plan.owner[i] == p) wanted[plan.defs[i]] = 0;
+        if (plan.owner[i] == p) owned.insert(plan.defs[i]);
     }
-    for (unsigned def : plan.imports[p]) wanted[plan.defs[def]] = 1;
     ValueToValueMapTy vmap;
     std::unique_ptr<Module> part = CloneModule(module, vmap, [&](const GlobalValue *gv) {
-        return wanted.count(gv) != 0;
+        return owned.count(gv) != 0;
     });
-    for (unsigned def : plan.imports[p]) {
-        auto *copy = cast<GlobalValue>(vmap[plan.defs[def]]);
-        copy->setLinkage(GlobalValue::AvailableExternallyLinkage);
-    }
     raw_svector_ostream stream(out);
     WriteBitcodeToFile(*part, stream);
+}
+
+std::vector<SmallVector<char, 0>> splitModuleToBitcode(Module &module, unsigned partition_count,
+                                                       std::vector<std::string> &renamed) {
+    std::vector<SmallVector<char, 0>> bitcode(partition_count);
+    PartitionPlan plan = planPartitions(module, partition_count, renamed);
+    for (unsigned p = 0; p < partition_count; p++) writePartitionBitcode(module, plan, p, bitcode[p]);
+    return bitcode;
 }
 
 TargetMachine *cloneTargetMachine(const TargetMachine &tm) {
@@ -844,6 +821,87 @@ TargetMachine *cloneTargetMachine(const TargetMachine &tm) {
                                               tm.getTargetFeatureString(), tm.Options,
                                               tm.getRelocationModel(), tm.getCodeModel(),
                                               tm.getOptLevel());
+}
+
+// Runs `work(part index)` for every part on up to `thread_count` threads, largest parts
+// first. Returns the first error any part reported.
+std::string forEachPartition(const std::vector<SmallVector<char, 0>> &bitcode, size_t thread_count,
+                             const std::function<std::string(unsigned)> &work) {
+    const size_t count = bitcode.size();
+    std::vector<unsigned> order(count);
+    std::iota(order.begin(), order.end(), 0u);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](unsigned a, unsigned b) { return bitcode[a].size() > bitcode[b].size(); });
+    std::atomic<size_t> next{0};
+    std::mutex error_mutex;
+    std::string first_error;
+    auto worker = [&] {
+        for (size_t k; (k = next.fetch_add(1)) < count;) {
+            std::string error = work(order[k]);
+            if (!error.empty()) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (first_error.empty()) first_error = error;
+            }
+        }
+    };
+    // LLVM recurses on large functions; give workers the main thread's 64 MiB stack.
+    const size_t workers = std::max<size_t>(1, std::min(thread_count, count));
+    std::vector<llvm::thread> threads;
+    for (size_t w = 1; w < workers; w++) threads.emplace_back(std::optional<unsigned>(64u << 20), worker);
+    worker();
+    for (llvm::thread &t : threads) t.join();
+    return first_error;
+}
+
+Expected<std::unique_ptr<Module>> parsePartition(const SmallVector<char, 0> &bitcode, LLVMContext &context) {
+    return parseBitcodeFile(MemoryBufferRef(StringRef(bitcode.data(), bitcode.size()), "roc_part"), context);
+}
+
+// The function-local start of the optimization pipeline (see step 1 above).
+void runFunctionCleanup(Module &module, TargetMachine &tm, bool no_target_libcalls) {
+    PipelineTuningOptions pipeline_opts;
+    PassBuilder pass_builder(&tm, pipeline_opts);
+    LoopAnalysisManager loop_am;
+    FunctionAnalysisManager function_am;
+    CGSCCAnalysisManager cgscc_am;
+    ModuleAnalysisManager module_am;
+    function_am.registerPass([&] { return pass_builder.buildDefaultAAPipeline(); });
+    auto tlii = std::make_unique<TargetLibraryInfoImpl>(Triple(module.getTargetTriple()));
+    if (no_target_libcalls) tlii->disableAllFunctions();
+    function_am.registerPass([&] { return TargetLibraryAnalysis(*tlii); });
+    pass_builder.registerModuleAnalyses(module_am);
+    pass_builder.registerCGSCCAnalyses(cgscc_am);
+    pass_builder.registerFunctionAnalyses(function_am);
+    pass_builder.registerLoopAnalyses(loop_am);
+    pass_builder.crossRegisterProxies(loop_am, function_am, cgscc_am, module_am);
+    FunctionPassManager cleanup;
+    cleanup.addPass(SROAPass(SROAOptions::ModifyCFG));
+    cleanup.addPass(MemCpyOptPass());
+    cleanup.addPass(EarlyCSEPass(/*UseMemorySSA=*/true));
+    cleanup.addPass(InstCombinePass());
+    cleanup.addPass(SimplifyCFGPass());
+    cleanup.addPass(SROAPass(SROAOptions::ModifyCFG));
+    ModulePassManager module_pm;
+    module_pm.addPass(createModuleToFunctionPassAdaptor(std::move(cleanup)));
+    module_pm.run(module, module_am);
+}
+
+bool emitObjectFile(TargetMachine &tm, Module &module, const char *path, std::string &error) {
+    std::unique_ptr<raw_fd_ostream> dest;
+    char *message = nullptr;
+    if (openEmitFile(path, dest, &message)) {
+        error = message;
+        free(message);
+        return true;
+    }
+    legacy::PassManager codegen_pm;
+    codegen_pm.add(createTargetTransformInfoWrapperPass(tm.getTargetIRAnalysis()));
+    if (tm.addPassesToEmitFile(codegen_pm, *dest, nullptr, CodeGenFileType::ObjectFile)) {
+        error = "TargetMachine can't emit an object file";
+        return true;
+    }
+    codegen_pm.run(module);
+    return false;
 }
 
 } // end anonymous namespace
@@ -858,10 +916,10 @@ ZIG_EXTERN_C size_t ZigLLVMPartitionCount(LLVMModuleRef module_ref, const ZigLLV
         return 1;
     }
     if (!module.debug_compile_units().empty() || !moduleCanBePartitioned(module)) return 1;
+    if (const char *forced = std::getenv("ROC_LLVM_PARTS")) return (size_t)std::max(1, std::atoi(forced));
     uint64_t total = 0;
     for (const Function &f : module) total += f.getInstructionCount();
-    uint64_t parts = total / kInstructionsPerPartition;
-    return (size_t)std::clamp<uint64_t>(parts, 1, kMaxPartitions);
+    return (size_t)std::clamp<uint64_t>(total / kInstructionsPerPartition, 1, kMaxPartitions);
 }
 
 ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitPartitionedObjects(LLVMTargetMachineRef targ_machine_ref,
@@ -874,62 +932,81 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitPartitionedObjects(LLVMTargetMachineRe
         return ZigLLVMTargetMachineEmitToFile(targ_machine_ref, module_ref, error_message, &single);
     }
     TimePassesIsEnabled = false;
-    Module &module = *unwrap(module_ref);
-    const TargetMachine &parent_tm = *reinterpret_cast<TargetMachine *>(targ_machine_ref);
+    TargetMachine &parent_tm = *reinterpret_cast<TargetMachine *>(targ_machine_ref);
+    Module *module = unwrap(module_ref);
 
-    std::vector<SmallVector<char, 0>> bitcode(partition_count);
-    {
-        PartitionPlan plan = planPartitions(module, (unsigned)partition_count);
-        for (unsigned p = 0; p < partition_count; p++) writePartitionBitcode(module, plan, p, bitcode[p]);
-    }
-
-    // Largest parts first, so the longest one starts at once.
-    std::vector<unsigned> order(partition_count);
-    std::iota(order.begin(), order.end(), 0u);
-    std::stable_sort(order.begin(), order.end(),
-                     [&](unsigned a, unsigned b) { return bitcode[a].size() > bitcode[b].size(); });
-
-    std::atomic<size_t> next{0};
-    std::mutex error_mutex;
-    std::string first_error;
-    auto worker = [&] {
-        for (size_t k; (k = next.fetch_add(1)) < partition_count;) {
-            unsigned p = order[k];
+    // Step 1: function-local cleanup in parallel, then one module again.
+    LLVMContext merged_context;
+    std::unique_ptr<Module> merged;
+    const char *cleanup_env = std::getenv("ROC_LLVM_CLEANUP");
+    if (!cleanup_env || std::atoi(cleanup_env) != 0) {
+        std::vector<std::string> renamed;
+        std::vector<SmallVector<char, 0>> parts = splitModuleToBitcode(*module, (unsigned)partition_count, renamed);
+        std::string error = forEachPartition(parts, thread_count, [&](unsigned p) -> std::string {
             LLVMContext context;
-            Expected<std::unique_ptr<Module>> part = parseBitcodeFile(
-                MemoryBufferRef(StringRef(bitcode[p].data(), bitcode[p].size()), "roc_part"), context);
-            std::string error;
+            Expected<std::unique_ptr<Module>> part = parsePartition(parts[p], context);
+            if (!part) return toString(part.takeError());
+            std::unique_ptr<TargetMachine> tm(cloneTargetMachine(parent_tm));
+            runFunctionCleanup(**part, *tm, options->no_target_libcalls);
+            parts[p].clear();
+            raw_svector_ostream stream(parts[p]);
+            WriteBitcodeToFile(**part, stream);
+            return "";
+        });
+        if (!error.empty()) {
+            *error_message = strdup(error.c_str());
+            return true;
+        }
+        for (unsigned p = 0; p < parts.size(); p++) {
+            Expected<std::unique_ptr<Module>> part = parsePartition(parts[p], merged_context);
             if (!part) {
-                error = toString(part.takeError());
-            } else {
-                std::unique_ptr<TargetMachine> tm(cloneTargetMachine(parent_tm));
-                ZigLLVMEmitOptions part_options = *options;
-                part_options.bin_filename = object_paths[p];
-                std::unique_ptr<raw_fd_ostream> dest_bin;
-                char *message = nullptr;
-                if (openEmitFile(object_paths[p], dest_bin, &message) ||
-                    emitWithBinStream(reinterpret_cast<LLVMTargetMachineRef>(tm.get()), wrap(part->get()),
-                                      &message, &part_options, dest_bin.get(), object_paths[p])) {
-                    error = message ? message : "LLVM failed to emit a partition";
-                    free(message);
-                }
+                *error_message = strdup(toString(part.takeError()).c_str());
+                return true;
             }
-            SmallVector<char, 0>().swap(bitcode[p]);
-            if (!error.empty()) {
-                std::lock_guard<std::mutex> lock(error_mutex);
-                if (first_error.empty()) first_error = error;
+            SmallVector<char, 0>().swap(parts[p]);
+            if (!merged) {
+                merged = std::move(*part);
+            } else if (Linker::linkModules(*merged, std::move(*part))) {
+                *error_message = strdup("failed to link the cleaned-up partitions back together");
+                return true;
             }
         }
-    };
-    // LLVM recurses on large functions; give workers the main thread's 64 MiB stack.
-    const unsigned workers = (unsigned)std::max<size_t>(1, std::min(thread_count, partition_count));
-    std::vector<llvm::thread> threads;
-    for (unsigned w = 1; w < workers; w++) threads.emplace_back(std::optional<unsigned>(64u << 20), worker);
-    worker();
-    for (llvm::thread &t : threads) t.join();
+        // The cross-part symbols were only needed while the module was split.
+        for (const std::string &name : renamed) {
+            if (GlobalValue *gv = merged->getNamedValue(name)) {
+                gv->setLinkage(GlobalValue::InternalLinkage);
+                gv->setVisibility(GlobalValue::DefaultVisibility);
+            }
+        }
+        module = merged.get();
+    }
 
-    if (!first_error.empty()) {
-        *error_message = strdup(first_error.c_str());
+    // Step 2: the whole-module pipeline. No codegen output here: dest_bin is null.
+    {
+        ZigLLVMEmitOptions optimize_only = *options;
+        optimize_only.bin_filename = nullptr;
+        if (emitWithBinStream(targ_machine_ref, wrap(module), error_message, &optimize_only, nullptr, "roc_app")) {
+            return true;
+        }
+    }
+
+    // Step 3: code generation in parallel.
+    std::vector<std::string> renamed;
+    std::vector<SmallVector<char, 0>> parts = splitModuleToBitcode(*module, (unsigned)partition_count, renamed);
+    merged.reset();
+    std::string error = forEachPartition(parts, thread_count, [&](unsigned p) -> std::string {
+        LLVMContext context;
+        Expected<std::unique_ptr<Module>> part = parsePartition(parts[p], context);
+        if (!part) return toString(part.takeError());
+        std::unique_ptr<TargetMachine> tm(cloneTargetMachine(parent_tm));
+        std::string emit_error;
+        emitObjectFile(*tm, **part, object_paths[p], emit_error);
+        part->reset();
+        SmallVector<char, 0>().swap(parts[p]);
+        return emit_error;
+    });
+    if (!error.empty()) {
+        *error_message = strdup(error.c_str());
         return true;
     }
     return false;
