@@ -8708,6 +8708,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 plan.values.items[target_index].representative = source;
                 alias_links[target_index] = .{ .parent = source, .offset = offset, .projected = assign.op.kind == .field };
             }
+            try self.placeAggregateOperands(&plan, work.items, alias_links);
             for (plan.values.items, 0..) |v, i| {
                 const root_index = plan.representative(@intCast(i));
                 if (root_index != i or self.local_locations.contains(localKey(v.local))) continue;
@@ -8755,6 +8756,66 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         const AliasLink = struct { parent: u32, offset: u32, projected: bool };
+
+        /// Store a value whose only use is as a field (or payload) of the
+        /// record (or tag) built from it straight in that aggregate's bytes,
+        /// so the aggregate is assembled where its parts are produced instead
+        /// of copying each finished part into it. The part becomes an alias of
+        /// the aggregate at the part's offset, which keeps the aggregate's slot
+        /// reserved from the part's definition on. Only values defined once,
+        /// never reassigned and read exactly once qualify, so nothing else can
+        /// observe the aggregate's bytes before it is built.
+        fn placeAggregateOperands(self: *Self, plan: *StackPlan, stmts: []const CFStmtId, alias_links: []?AliasLink) Allocator.Error!void {
+            const reads = try self.allocator.alloc(u32, plan.values.items.len);
+            defer self.allocator.free(reads);
+            @memset(reads, 0);
+            for (plan.accesses.items) |access| {
+                if (access.read) reads[access.value] += 1;
+            }
+            const ls = self.layout_store;
+            for (stmts) |id| {
+                switch (self.store.getCFStmt(id)) {
+                    .assign_struct => |s| {
+                        const struct_layout = ls.getLayout(self.localLayout(s.target));
+                        if (struct_layout.tag != .struct_) continue;
+                        const struct_idx = struct_layout.getStruct().idx;
+                        const fields = self.store.getLocalSpan(s.fields);
+                        for (0..fields.len) |i| {
+                            self.placeOperand(plan, alias_links, reads, GuardedList.at(fields, i), s.target, ls.getStructFieldOffsetByOriginalIndex(struct_idx, @intCast(i)), ls.getStructFieldLayoutByOriginalIndex(struct_idx, @intCast(i)));
+                        }
+                    },
+                    .assign_tag => |t| {
+                        const payload = t.payload orelse continue;
+                        const union_layout = ls.getLayout(self.localLayout(t.target));
+                        if (union_layout.tag != .tag_union) continue;
+                        const variants = ls.getTagUnionVariants(ls.getTagUnionData(union_layout.getTagUnion().idx));
+                        if (@as(usize, t.variant_index) >= variants.len) continue;
+                        // `generateTag` stores the payload at offset 0.
+                        self.placeOperand(plan, alias_links, reads, payload, t.target, 0, variants.get(t.variant_index).payload_layout);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        fn placeOperand(self: *Self, plan: *StackPlan, alias_links: []?AliasLink, reads: []const u32, part: LocalId, aggregate: LocalId, offset: u32, part_layout: layout.Idx) void {
+            const part_index = plan.localIndex(part) orelse return;
+            const aggregate_index = plan.localIndex(aggregate) orelse return;
+            if (part_index == aggregate_index) return;
+            const p = plan.values.items[part_index];
+            const a = plan.values.items[aggregate_index];
+            if (p.definitions != 1 or a.definitions != 1 or p.mutable or a.mutable) return;
+            if (reads[part_index] != 1) return;
+            if (plan.representative(part_index) != part_index or alias_links[part_index] != null) return;
+            if (plan.representative(aggregate_index) == part_index) return;
+            if (self.local_locations.contains(localKey(part)) or self.local_locations.contains(localKey(aggregate))) return;
+            const rep = self.runtimeRepresentationLayoutIdx(self.localLayout(part));
+            if (rep != self.runtimeRepresentationLayoutIdx(part_layout)) return;
+            if (rep == .f32 or rep == .f64 or self.simdKindForLayout(rep) != null) return;
+            if (self.getLayoutSize(self.localLayout(part)) == 0) return;
+            plan.values.items[part_index].representative = aggregate_index;
+            alias_links[part_index] = .{ .parent = aggregate_index, .offset = offset, .projected = true };
+        }
 
         /// The byte offset of field `field_idx` in `source`, when `target`
         /// can be stored inside `source`'s own bytes: `source` is a struct held
@@ -13577,7 +13638,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             if (loc != .stack) return null;
             const size = self.getLayoutSize(self.localLayout(target_local));
             if (size == 0) return null;
-            var check = OperandOverlap{ .owner = self, .target = target_local, .start = loc.stack.offset, .end = loc.stack.offset + @as(i32, @intCast(size)) };
+            var check = OperandOverlap{ .owner = self, .stmt = stmt, .target = target_local, .start = loc.stack.offset, .end = loc.stack.offset + @as(i32, @intCast(size)) };
             lir.BodyClone.forEachStmtRead(self.store, stmt, &check, OperandOverlap.noteRead);
             lir.BodyClone.forEachStmtDef(self.store, stmt, &check, OperandOverlap.noteDef);
             return if (check.overlaps) null else loc.stack.offset;
@@ -13585,14 +13646,41 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
         const OperandOverlap = struct {
             owner: *Self,
+            stmt: lir.LIR.CFStmt,
             target: LocalId,
             start: i32,
             end: i32,
             overlaps: bool = false,
 
-            /// A read of the target itself overlaps it too.
+            /// A read of the target itself overlaps it too. An operand already
+            /// stored where the aggregate puts it (`placeAggregateOperands`)
+            /// does not: building copies it onto itself and writes nothing
+            /// else over its bytes.
             fn noteRead(check: *@This(), local: LocalId) void {
+                if (check.inPlace(local)) return;
                 check.note(local);
+            }
+
+            fn inPlace(check: *@This(), local: LocalId) bool {
+                const owner = check.owner;
+                const loc = owner.local_locations.get(localKey(local)) orelse return false;
+                const at = frameOffsetOf(loc) orelse return false;
+                const ls = owner.layout_store;
+                switch (check.stmt) {
+                    .assign_struct => |s| {
+                        const struct_layout = ls.getLayout(owner.localLayout(s.target));
+                        if (struct_layout.tag != .struct_) return false;
+                        const struct_idx = struct_layout.getStruct().idx;
+                        const fields = owner.store.getLocalSpan(s.fields);
+                        for (0..fields.len) |i| {
+                            if (GuardedList.at(fields, i) != local) continue;
+                            return at == check.start + @as(i32, @intCast(ls.getStructFieldOffsetByOriginalIndex(struct_idx, @intCast(i))));
+                        }
+                        return false;
+                    },
+                    .assign_tag => |t| return t.payload == local and at == check.start,
+                    else => return false,
+                }
             }
 
             fn noteDef(check: *@This(), local: LocalId) void {
@@ -13853,8 +13941,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 return self.stackLocationForLayout(tag.target_layout, base_offset);
             } else if (tag.payload) |payload_local| {
                 const base_offset = dest orelse self.codegen.allocStackSlot(stack_size);
-                try self.zeroStackArea(base_offset, stack_size);
-
                 const arg_loc = try self.coerceRefLocalValueToLayout(
                     try self.emitValueLocal(payload_local),
                     self.valueLayout(payload_local),
@@ -13863,7 +13949,15 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 );
                 const payload_layout = ls.getLayout(variant_payload_layout);
                 const payload_size: u32 = ls.layoutSizeAlign(payload_layout).size;
-                try self.copyBytesToStackOffset(base_offset, arg_loc, payload_size);
+                const in_place = if (frameOffsetOf(arg_loc)) |at| at == base_offset else false;
+                if (in_place) {
+                    // The payload was built in place (`placeAggregateOperands`):
+                    // zero only the bytes after it.
+                    try self.zeroStackArea(base_offset + @as(i32, @intCast(payload_size)), stack_size - payload_size);
+                } else {
+                    try self.zeroStackArea(base_offset, stack_size);
+                    try self.copyBytesToStackOffset(base_offset, arg_loc, payload_size);
+                }
 
                 const disc_offset = tu_data.discriminant_offset.get(self.layout_store.targetUsize());
                 const disc_size = tu_data.discriminant_size;
@@ -17212,6 +17306,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Copy a specific number of bytes from a value location to a stack offset.
         fn copyBytesToStackOffset(self: *Self, dest_offset: i32, loc: ValueLocation, size: u32) Allocator.Error!void {
             if (size == 0) return;
+            // A value built in place already occupies the destination.
+            if (frameOffsetOf(loc)) |at| if (at == dest_offset) return;
 
             switch (loc) {
                 .immediate_i64 => |val| {
