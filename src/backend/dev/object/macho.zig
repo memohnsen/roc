@@ -413,6 +413,19 @@ pub const MachOWriter = struct {
         return offset;
     }
 
+    /// Every section is 16-byte aligned (`Section64.align` = 4).
+    const section_alignment: u64 = 16;
+
+    /// The object-space address of `__const`: the first multiple of its
+    /// alignment after `__text`. The linker keeps each datum's address modulo
+    /// its section's alignment, so placing the section straight after a
+    /// `__text` whose size is not a multiple of 16 would misalign every
+    /// constant in it: a static string's refcount word, read before every
+    /// increment, would then straddle two words.
+    fn rodataAddress(self: *const Self) u64 {
+        return std.mem.alignForward(u64, self.text.len, section_alignment);
+    }
+
     /// Write the Mach-O object file
     pub fn write(self: *Self, output: *std.ArrayList(u8)) Allocator.Error!void {
         // Calculate sizes
@@ -437,6 +450,9 @@ pub const MachOWriter = struct {
         const debug_abbrev_size: u32 = @intCast(self.debug.abbrev.len);
         const debug_info_offset: u32 = debug_abbrev_offset + debug_abbrev_size;
         const debug_info_size: u32 = @intCast(self.debug.info.len);
+        const rodata_addr = self.rodataAddress();
+        const debug_addr_base: u64 = rodata_addr + rodata_size;
+        const zero_fill_addr: u64 = std.mem.alignForward(u64, debug_addr_base + debug_line_size + debug_abbrev_size + debug_info_size, section_alignment);
         // Segment-backed sections are contiguous. Relocation tables follow
         // the segment and do not inflate its file extent beyond virtual size.
         const text_reloc_offset: u32 = debug_info_offset + debug_info_size;
@@ -512,7 +528,7 @@ pub const MachOWriter = struct {
         const segment_cmd = SegmentCommand64{
             .cmd = MachO.LC_SEGMENT_64,
             .cmdsize = segment_cmd_size,
-            .vmsize = @as(u64, text_size) + rodata_size + debug_line_size + debug_abbrev_size + debug_info_size + self.zero_fill_size,
+            .vmsize = zero_fill_addr + self.zero_fill_size,
             .fileoff = text_offset,
             // The segment's file extent covers the five byte-backed sections,
             // including DWARF; `__bss` adds only to its virtual size.
@@ -540,7 +556,7 @@ pub const MachOWriter = struct {
         const rodata_section = Section64{
             .sectname = comptime name16("__const"),
             .segname = comptime name16("__DATA"),
-            .addr = text_size,
+            .addr = rodata_addr,
             .size = rodata_size,
             .offset = rodata_offset,
             .@"align" = 4,
@@ -550,8 +566,6 @@ pub const MachOWriter = struct {
         output.appendSliceAssumeCapacity(std.mem.asBytes(&rodata_section));
 
         const dwarf_segname = comptime name16("__DWARF");
-        const debug_addr_base: u64 = @as(u64, text_size) + rodata_size;
-        const zero_fill_addr: u64 = debug_addr_base + debug_line_size + debug_abbrev_size + debug_info_size;
 
         const debug_line_section = Section64{
             .sectname = comptime name16("__debug_line"),
@@ -705,7 +719,7 @@ pub const MachOWriter = struct {
             const section_addr: u64 = switch (sym.section) {
                 0 => 0,
                 1 => 0,
-                2 => text_size,
+                2 => rodata_addr,
                 zero_fill_section_number => zero_fill_addr,
                 else => unreachable,
             };
@@ -773,7 +787,7 @@ pub const MachOWriter = struct {
 
         const section_addr: u64 = switch (symbol.section) {
             1 => 0,
-            2 => @as(u64, @intCast(self.text.len)),
+            2 => self.rodataAddress(),
             else => unreachable,
         };
         const base = section_addr + symbol.offset;
@@ -930,6 +944,37 @@ test "DWARF sections relocate only text addresses in the written object" {
         }
     }
     try std.testing.expect(saw_info);
+}
+
+test "macho data sections start at aligned addresses after unaligned text" {
+    const allocator = std.testing.allocator;
+    var writer = try MachOWriter.init(allocator, .aarch64);
+    defer writer.deinit();
+    // Three instructions: 12 bytes, so `__const` would start at 12.
+    writer.setCode(&.{ 0x1f, 0x20, 0x03, 0xd5, 0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6 });
+    writer.setRodata(&(@as([24]u8, @splat(0))));
+    writer.setZeroFill(8);
+    const data = try writer.addSymbol(.{ .name = "data", .section = 2, .offset = 8, .is_external = true });
+    _ = data;
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+    try writer.write(&output);
+    const segment = std.mem.bytesToValue(SegmentCommand64, output.items[@sizeOf(MachHeader64)..][0..@sizeOf(SegmentCommand64)]);
+    const sections_offset = @sizeOf(MachHeader64) + @sizeOf(SegmentCommand64);
+    var rodata_addr: ?u64 = null;
+    for (0..segment.nsects) |index| {
+        const offset = sections_offset + index * @sizeOf(Section64);
+        const section = std.mem.bytesToValue(Section64, output.items[offset..][0..@sizeOf(Section64)]);
+        if (section.@"align" != 0) try std.testing.expectEqual(@as(u64, 0), section.addr % (@as(u64, 1) << @intCast(section.@"align")));
+        if (std.mem.eql(u8, std.mem.sliceTo(&section.sectname, 0), "__const")) rodata_addr = section.addr;
+        try std.testing.expect(section.addr + section.size <= segment.vmaddr + segment.vmsize);
+    }
+    try std.testing.expectEqual(@as(?u64, 16), rodata_addr);
+    // The symbol keeps its offset within the section.
+    const symtab_offset = sections_offset + segment.nsects * @sizeOf(Section64);
+    const symtab = std.mem.bytesToValue(SymtabCommand, output.items[symtab_offset..][0..@sizeOf(SymtabCommand)]);
+    const nlist = std.mem.bytesToValue(Nlist64, output.items[symtab.symoff..][0..@sizeOf(Nlist64)]);
+    try std.testing.expectEqual(@as(u64, 16 + 8), nlist.n_value);
 }
 
 test "macho segment file extent contains every declared section" {
