@@ -100,6 +100,10 @@ const TaskContext = struct {
     trmc_report: ?Trmc.Report = null,
     first_fresh_join: u32 = 0,
     fresh_join_count: u32 = 0,
+    /// Rows the shard prepared and appended, kept for the metrics because an
+    /// unchanged shard is released as soon as its task finishes.
+    prepared_statement_rows: u32 = 0,
+    appended_statements: u32 = 0,
 
     fn run(context_opaque: *anyopaque, worker: TaskExecutor.Worker) ?*anyopaque {
         const self: *TaskContext = @ptrCast(@alignCast(context_opaque));
@@ -148,6 +152,16 @@ const TaskContext = struct {
             .box_reuse => try BoxReuse.runProcWithScratch(&shard, self.layouts, self.proc, scratch_allocator, analysis.?),
         }
         self.changed = shard.procRewriteChanged();
+        self.prepared_statement_rows = @intCast(shard.procRewriteStatementIds().len);
+        self.appended_statements = @intCast(shard.cf_stmts.len());
+        // An unchanged shard commits nothing, so release it now rather than
+        // after the whole phase: retaining every procedure's shard until the
+        // commit held a second copy of the program and set the build's peak
+        // memory. Debug builds keep it to validate statement ownership.
+        if (!self.changed and builtin.mode != .debug) {
+            shard.deinit();
+            return;
+        }
         self.shard = shard;
     }
 };
@@ -243,7 +257,7 @@ pub fn run(
     for (contexts.items) |context| {
         if (!context.completed) invariant("LIR pass lost a task completion");
         if (context.failed) return error.OutOfMemory;
-        if (context.shard == null) invariant("LIR pass completed without a procedure rewrite");
+        if (context.shard == null and (context.changed or builtin.mode == .debug)) invariant("LIR pass completed without a procedure rewrite");
     }
     if (builtin.mode == .debug) {
         validateWritableOwnership(allocator, contexts.items) catch |err| switch (err) {
@@ -254,18 +268,18 @@ pub fn run(
 
     var next_fresh_join = first_fresh_join;
     for (contexts.items) |*context| {
-        const shard = &context.shard.?;
         if (context.verify_only) {
             if (context.changed) base.invariant("LIR pass {s} rewrote procedure {d} whose shapes {any} excluded it from the phase", .{ @tagName(phase), @backingInt(context.proc), store.getProcSpecImmediate(context.proc).shapes });
             if (parallel) if (metrics) |counts| {
                 counts.tasks_committed +|= 1;
                 counts.committed_by_phase[@backingInt(phase)] +|= 1;
             };
-            shard.deinit();
+            if (context.shard) |*shard| shard.deinit();
             context.shard = null;
             continue;
         }
         if (context.changed) {
+            const shard = &context.shard.?;
             const reservation = reserveJoins(first_fresh_join, next_fresh_join, context.fresh_join_count) catch
                 invariant("LIR rewrite exhausted join-point identities");
             store.commitProcRewriteWithJoinRelocation(shard, reservation.relocation) catch |err| switch (err) {
@@ -279,11 +293,11 @@ pub fn run(
             counts.tasks_committed +|= 1;
             counts.committed_by_phase[@backingInt(phase)] +|= 1;
             counts.changed_by_phase[@backingInt(phase)] +|= @intFromBool(context.changed);
-            counts.prepared_statement_rows +|= @intCast(shard.procRewriteStatementIds().len);
-            counts.appended_statements +|= @intCast(shard.cf_stmts.len());
+            counts.prepared_statement_rows +|= context.prepared_statement_rows;
+            counts.appended_statements +|= context.appended_statements;
         };
         if (context.trmc_report) |report| Trmc.reportProc(store, layouts, context.proc, report);
-        shard.deinit();
+        if (context.shard) |*shard| shard.deinit();
         context.shard = null;
     }
 }
