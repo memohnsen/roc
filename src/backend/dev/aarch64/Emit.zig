@@ -1828,6 +1828,40 @@ pub fn Emit(comptime target: RocTarget) type {
             try self.emit32(inst);
         }
 
+        /// How an LDP/STP of two Q registers addresses memory.
+        pub const PairQAddressing = enum(u32) {
+            /// `[base, #imm]`, no writeback.
+            signed_offset = 0b010,
+            /// `[base], #imm`: access at `base`, then add `imm` to it.
+            post_index = 0b001,
+        };
+
+        /// LDP/STP <Qt1>, <Qt2> (two 128-bit SIMD registers). `offset` is in
+        /// bytes, a multiple of 16 in [-1024, 1008].
+        pub fn pairQ(self: *Self, load: bool, mode: PairQAddressing, reg1: FloatReg, reg2: FloatReg, base: GeneralReg, offset: i32) Allocator.Error!void {
+            std.debug.assert(@mod(offset, 16) == 0 and offset >= -1024 and offset <= 1008);
+            const imm7: u7 = @bitCast(@as(i7, @intCast(@divExact(offset, 16))));
+            const inst: u32 = (0b10 << 30) |
+                (0b101 << 27) |
+                (0b1 << 26) |
+                (@as(u32, @backingInt(mode)) << 23) |
+                (@as(u32, @intFromBool(load)) << 22) |
+                (@as(u32, imm7) << 15) |
+                (@as(u32, reg2.enc()) << 10) |
+                (@as(u32, base.enc()) << 5) |
+                reg1.enc();
+            try self.emit32(inst);
+        }
+
+        /// SUBS <Xd>, <Xn>, #imm12: subtract and set the flags.
+        pub fn subsRegRegImm12(self: *Self, dst: GeneralReg, src: GeneralReg, imm: u12) Allocator.Error!void {
+            const inst: u32 = 0xF1000000 |
+                (@as(u32, imm) << 10) |
+                (@as(u32, src.enc()) << 5) |
+                dst.enc();
+            try self.emit32(inst);
+        }
+
         pub fn ldrQRegMemSoff(self: *Self, dst: FloatReg, base: GeneralReg, offset: i32) Allocator.Error!void {
             if (offset >= 0) {
                 const uoff: u32 = @intCast(offset);
@@ -1914,6 +1948,26 @@ test "add reg, reg, imm12" {
     // add x0, x1, #0x10 (0x91004020)
     try asm_buf.addRegRegImm12(.w64, .X0, .X1, 0x10);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x20, 0x40, 0x00, 0x91 }, asm_buf.buf.items);
+}
+
+test "q-register pairs and subs imm12" {
+    var asm_buf = LinuxEmit.init(std.testing.allocator);
+    defer asm_buf.deinit();
+
+    try asm_buf.pairQ(true, .signed_offset, .V0, .V1, .X2, 32); // ldp q0, q1, [x2, #32]
+    try asm_buf.pairQ(false, .signed_offset, .V0, .V1, .X3, 32); // stp q0, q1, [x3, #32]
+    try asm_buf.pairQ(true, .post_index, .V0, .V1, .X2, 32); // ldp q0, q1, [x2], #32
+    try asm_buf.pairQ(false, .post_index, .V0, .V1, .X3, 32); // stp q0, q1, [x3], #32
+    try asm_buf.pairQ(true, .signed_offset, .V0, .V1, .X2, -32); // ldp q0, q1, [x2, #-32]
+    try asm_buf.subsRegRegImm12(.X4, .X4, 1); // subs x4, x4, #1
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x40, 0x04, 0x41, 0xad,
+        0x60, 0x04, 0x01, 0xad,
+        0x40, 0x04, 0xc1, 0xac,
+        0x60, 0x04, 0x81, 0xac,
+        0x40, 0x04, 0x7f, 0xad,
+        0x84, 0x04, 0x00, 0xf1,
+    }, asm_buf.buf.items);
 }
 
 test "cmp reg, reg" {

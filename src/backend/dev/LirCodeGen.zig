@@ -17551,6 +17551,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             // Bound instruction size independently of the aggregate size. This
             // is an encoding limit, not a representation or ownership decision.
             if (size > 32) {
+                if (try self.copyWide(temp_reg, src_base, src_offset, dst_base, dst_offset, size)) return;
                 const src = try self.allocTempGeneral();
                 defer self.codegen.freeGeneral(src);
                 const dst = try self.allocTempGeneral();
@@ -17610,6 +17611,139 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
         }
 
+        /// Copies of at most this many 32-byte blocks are unrolled; longer ones
+        /// loop. Unrolling saves the loop's counter and branch on the small
+        /// copies that dominate (a record of a few fields), while the loop
+        /// bounds the code a large record's copy takes.
+        const max_unrolled_copy_blocks: u32 = 4;
+
+        /// Copy `size` (> 32) bytes with 16-byte vector moves, two registers
+        /// per 32-byte block, under the same contract as `copyChunked`: exactly
+        /// `size` bytes, every block loaded before it is stored, and source and
+        /// destination not overlapping. Returns false, having emitted nothing,
+        /// when two vector temporaries are not free, so the caller falls back
+        /// to general registers.
+        fn copyWide(self: *Self, temp_reg: GeneralReg, src_base: GeneralReg, src_offset: i32, dst_base: GeneralReg, dst_offset: i32, size: u32) Allocator.Error!bool {
+            std.debug.assert(size > 32);
+            const v0 = self.codegen.allocFloat() orelse return false;
+            defer self.codegen.freeFloat(v0);
+            const v1 = self.codegen.allocFloat() orelse return false;
+            defer self.codegen.freeFloat(v1);
+            const src = try self.allocTempGeneral();
+            defer self.codegen.freeGeneral(src);
+            const dst = try self.allocTempGeneral();
+            defer self.codegen.freeGeneral(dst);
+            inline for (.{ src, dst }) |reg| {
+                std.debug.assert(reg != temp_reg and reg != src_base and reg != dst_base);
+            }
+            try self.emitAddressOf(src, src_base, src_offset);
+            try self.emitAddressOf(dst, dst_base, dst_offset);
+
+            const blocks = size / 32;
+            var tail: i32 = 0;
+            if (blocks <= max_unrolled_copy_blocks) {
+                var block: u32 = 0;
+                while (block < blocks) : (block += 1) {
+                    const at: i32 = @intCast(block * 32);
+                    try self.emitVectorPair(.load, v0, v1, src, at, .signed_offset);
+                    try self.emitVectorPair(.store, v0, v1, dst, at, .signed_offset);
+                }
+                tail = @intCast(blocks * 32);
+            } else {
+                const count = try self.allocTempGeneral();
+                defer self.codegen.freeGeneral(count);
+                std.debug.assert(count != temp_reg and count != src_base and count != dst_base);
+                try self.codegen.emitLoadImm(count, blocks);
+                const loop = self.codegen.currentOffset();
+                try self.emitVectorPair(.load, v0, v1, src, 0, .post_index);
+                try self.emitVectorPair(.store, v0, v1, dst, 0, .post_index);
+                try self.emitDecrementAndLoop(count, loop);
+            }
+
+            if (size % 32 >= 16) {
+                try self.emitVectorMove(.load, v0, src, tail);
+                try self.emitVectorMove(.store, v0, dst, tail);
+                tail += 16;
+            }
+            // Fewer than 16 bytes remain: general registers copy them exactly.
+            try self.copyChunked(temp_reg, src, tail, dst, tail, size % 16);
+            return true;
+        }
+
+        const VectorAccess = enum { load, store };
+        const VectorPairAddressing = enum { signed_offset, post_index };
+
+        /// Load or store 32 bytes at `[base + offset]` through two vector
+        /// registers. `.post_index` accesses `[base]` and then advances `base`
+        /// by 32 (`offset` must be 0).
+        fn emitVectorPair(self: *Self, access: VectorAccess, v0: FloatReg, v1: FloatReg, base_reg: GeneralReg, offset: i32, addressing: VectorPairAddressing) Allocator.Error!void {
+            if (comptime arch == .aarch64 or arch == .aarch64_be) {
+                switch (addressing) {
+                    .signed_offset => try self.codegen.emit.pairQ(access == .load, .signed_offset, v0, v1, base_reg, offset),
+                    .post_index => {
+                        std.debug.assert(offset == 0);
+                        try self.codegen.emit.pairQ(access == .load, .post_index, v0, v1, base_reg, 32);
+                    },
+                }
+            } else {
+                try self.emitVectorMove(access, v0, base_reg, offset);
+                try self.emitVectorMove(access, v1, base_reg, offset + 16);
+                if (addressing == .post_index) {
+                    std.debug.assert(offset == 0);
+                    try self.codegen.emit.addImm(base_reg, 32);
+                }
+            }
+        }
+
+        /// Load or store 16 bytes at `[base + offset]` through one vector register.
+        fn emitVectorMove(self: *Self, access: VectorAccess, reg: FloatReg, base_reg: GeneralReg, offset: i32) Allocator.Error!void {
+            if (comptime arch == .aarch64 or arch == .aarch64_be) {
+                switch (access) {
+                    .load => try self.codegen.emit.ldrQRegMemSoff(reg, base_reg, offset),
+                    .store => try self.codegen.emit.strQRegMemSoff(reg, base_reg, offset),
+                }
+            } else {
+                switch (access) {
+                    .load => try self.codegen.emit.movdquRegMem(reg, base_reg, offset),
+                    .store => try self.codegen.emit.movdquMemReg(base_reg, offset, reg),
+                }
+            }
+        }
+
+        /// Decrement `count` and branch back to `loop` until it reaches zero.
+        /// `loop` is behind the branch, so its offset is known here.
+        fn emitDecrementAndLoop(self: *Self, count: GeneralReg, loop: usize) Allocator.Error!void {
+            if (comptime arch == .aarch64 or arch == .aarch64_be) {
+                try self.codegen.emit.subsRegRegImm12(count, count, 1);
+                const here: i64 = @intCast(self.codegen.currentOffset());
+                try self.codegen.emit.bcond(.ne, @intCast(@as(i64, @intCast(loop)) - here));
+            } else {
+                // SUB sets ZF; JNE rel32 is six bytes, relative to its end.
+                try self.codegen.emit.subRegImm32(.w64, count, 1);
+                const end: i64 = @as(i64, @intCast(self.codegen.currentOffset())) + 6;
+                try self.codegen.emit.jne(@intCast(@as(i64, @intCast(loop)) - end));
+            }
+        }
+
+        /// `dst = base + offset`, in one instruction when the offset allows.
+        fn emitAddressOf(self: *Self, dst: GeneralReg, base_reg: GeneralReg, offset: i32) Allocator.Error!void {
+            std.debug.assert(dst != base_reg);
+            if (comptime arch == .aarch64 or arch == .aarch64_be) {
+                if (offset >= 0 and offset <= 4095) {
+                    try self.codegen.emit.addRegRegImm12(.w64, dst, base_reg, @intCast(offset));
+                    return;
+                }
+                if (offset < 0 and offset >= -4095) {
+                    try self.codegen.emit.subRegRegImm12(.w64, dst, base_reg, @intCast(-offset));
+                    return;
+                }
+                try self.codegen.emitLoadImm(dst, offset);
+                try self.codegen.emitAdd(.w64, dst, dst, base_reg);
+            } else {
+                try self.codegen.emit.leaRegMem(dst, base_reg, offset);
+            }
+        }
+
         /// The caller supplies three distinct scratch registers, disjoint from
         /// both bases and temp_reg. No call or frame allocation is emitted.
         fn copyLoop(self: *Self, temp_reg: GeneralReg, src_base: GeneralReg, src_offset: i32, dst_base: GeneralReg, dst_offset: i32, size: u32, src: GeneralReg, dst: GeneralReg, count: GeneralReg) Allocator.Error!void {
@@ -17659,22 +17793,41 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             if (size > 32) {
                 const dst = try self.allocTempGeneral();
                 defer self.codegen.freeGeneral(dst);
-                const count = try self.allocTempGeneral();
-                defer self.codegen.freeGeneral(count);
-                try self.codegen.emitLoadImm(dst, offset);
-                try self.codegen.emitAdd(.w64, dst, dst, base_reg);
-                try self.codegen.emitLoadImm(count, size / 8);
-                const loop = self.codegen.currentOffset();
-                try self.emitStore(.w64, dst, 0, value);
-                try self.emitAddImm(dst, dst, 8);
-                try self.emitSubImm(.w64, count, count, 1);
-                try self.emitCmpImm(count, 0);
-                const repeat = try self.emitJumpIfNotEqual();
-                try self.codegen.patchJump(repeat, loop);
-                try self.fillSmall(value, dst, 0, size % 8);
+                try self.emitAddressOf(dst, base_reg, offset);
+                const blocks = size / 32;
+                var tail: i32 = 0;
+                if (blocks <= max_unrolled_copy_blocks) {
+                    var block: u32 = 0;
+                    while (block < blocks) : (block += 1) {
+                        try self.fillBlock(value, dst, @intCast(block * 32));
+                    }
+                    tail = @intCast(blocks * 32);
+                } else {
+                    const count = try self.allocTempGeneral();
+                    defer self.codegen.freeGeneral(count);
+                    try self.codegen.emitLoadImm(count, blocks);
+                    const loop = self.codegen.currentOffset();
+                    try self.fillBlock(value, dst, 0);
+                    try self.emitAddImm(dst, dst, 32);
+                    try self.emitDecrementAndLoop(count, loop);
+                }
+                try self.fillSmall(value, dst, tail, size % 32);
             } else {
                 try self.fillSmall(value, base_reg, offset, size);
             }
+        }
+
+        /// Store `value` into the 32 bytes at `[base + offset]`.
+        fn fillBlock(self: *Self, value: GeneralReg, base_reg: GeneralReg, offset: i32) Allocator.Error!void {
+            if (comptime arch == .aarch64 or arch == .aarch64_be) {
+                if (offset <= 504 - 16) {
+                    try self.codegen.emit.stpSignedOffset(.w64, value, value, base_reg, @intCast(@divExact(offset, 8)));
+                    try self.codegen.emit.stpSignedOffset(.w64, value, value, base_reg, @intCast(@divExact(offset + 16, 8)));
+                    return;
+                }
+            }
+            var at = offset;
+            while (at < offset + 32) : (at += 8) try self.emitStore(.w64, base_reg, at, value);
         }
 
         fn fillSmall(self: *Self, value: GeneralReg, base_reg: GeneralReg, offset: i32, size: u32) Allocator.Error!void {
