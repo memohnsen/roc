@@ -9609,6 +9609,9 @@ const LlvmObjectPaths = struct {
     artifact_dir: []const u8,
     bitcode_path: []const u8,
     object_path: []const u8,
+    /// Every object the app compiled to, `object_path` first. Large native
+    /// builds split into parts that LLVM optimizes in parallel.
+    object_paths: []const []const u8,
 };
 
 fn staticDataLinkRootSymbols(
@@ -9935,6 +9938,7 @@ fn compileLlvmAppObject(
         r.begin("LLVM Optimize + Emit");
     }
 
+    var object_paths: []const []const u8 = &.{object_path};
     const compile_config = builder.CompileConfig{
         .input_path = bitcode_path,
         .output_path = object_path,
@@ -9953,6 +9957,12 @@ fn compileLlvmAppObject(
         },
         .pic = pic,
         .no_target_libcalls = noTargetLibcallsForLlvmBuild(target),
+        // wasm links its single object through its own path.
+        .partitioned = if (target.toCpuArch() == .wasm32) null else .{
+            .arena = ctx.arena,
+            .max_threads = args.max_threads orelse base.cpu_count.workerCount(),
+            .object_paths = &object_paths,
+        },
     };
 
     const success = try builder.compileBitcodeToObject(ctx.gpa, ctx.io.std_io, compile_config);
@@ -9965,6 +9975,7 @@ fn compileLlvmAppObject(
         .artifact_dir = artifact_dir,
         .bitcode_path = bitcode_path,
         .object_path = object_path,
+        .object_paths = object_paths,
     };
 }
 
@@ -10436,7 +10447,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResult
         const link_inputs = try collectPlatformLinkInputs(ctx, platform_dir, resolved_targets_config, target, link_type);
 
         var object_files = try std.array_list.Managed([]const u8).initCapacity(ctx.arena, 4);
-        try object_files.append(app_object.object_path);
+        try object_files.appendSlice(app_object.object_paths);
         if (static_data_obj_path) |path| {
             try object_files.append(path);
         }

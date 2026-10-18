@@ -91,6 +91,20 @@ pub const CompileConfig = struct {
     pic: bool = false, // Position-independent code (required for shared library output)
     no_target_libcalls: bool = false,
     lower_memory_intrinsics_to_loops: bool = false,
+    /// When set, a large module may be split into parts that LLVM optimizes and
+    /// code-generates in parallel, one object file per part. On success this
+    /// receives every object path, `output_path` first, allocated in
+    /// `partitioned.arena`. When null, the output is always the single
+    /// `output_path`.
+    partitioned: ?Partitioned = null,
+
+    pub const Partitioned = struct {
+        arena: Allocator,
+        /// The most parts to optimize at once. The parts themselves depend
+        /// only on the module, so the objects are the same for any count.
+        max_threads: usize,
+        object_paths: *[]const []const u8,
+    };
 };
 
 fn sanitizerCoverageOptions(enabled: bool) ZigLLVMCoverageOptions {
@@ -200,6 +214,16 @@ const llvm_externs = if (llvm_available) struct {
         module_ref: ?*anyopaque,
         error_message: *[*:0]u8,
         options: *const ZigLLVMEmitOptions,
+    ) bool;
+    extern fn ZigLLVMPartitionCount(module_ref: ?*anyopaque, options: *const ZigLLVMEmitOptions) usize;
+    extern fn ZigLLVMTargetMachineEmitPartitionedObjects(
+        targ_machine_ref: ?*anyopaque,
+        module_ref: ?*anyopaque,
+        error_message: *[*:0]u8,
+        options: *const ZigLLVMEmitOptions,
+        partition_count: usize,
+        thread_count: usize,
+        object_paths: [*]const [*:0]const u8,
     ) bool;
     extern fn ZigLLVMCreateTargetMachine(
         target_ref: ?*anyopaque,
@@ -778,6 +802,44 @@ pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileCon
         .no_target_libcalls = config.no_target_libcalls,
         .lower_memory_intrinsics_to_loops = config.lower_memory_intrinsics_to_loops,
     };
+
+    const partition_count: usize = if (config.partitioned != null)
+        externs.ZigLLVMPartitionCount(module, &emit_options)
+    else
+        1;
+    if (config.partitioned) |partitioned| {
+        if (partition_count > 1) {
+            const paths = try partitioned.arena.alloc([]const u8, partition_count);
+            const c_paths = try partitioned.arena.alloc([*:0]const u8, partition_count);
+            for (paths, c_paths, 0..) |*path, *c_path, index| {
+                const path_z = if (index == 0)
+                    try partitioned.arena.dupeSentinel(u8, config.output_path, 0)
+                else
+                    try std.fmt.allocPrintSentinel(partitioned.arena, "{s}.part{d}.o", .{ config.output_path, index }, 0);
+                path.* = path_z;
+                c_path.* = path_z.ptr;
+            }
+            if (externs.ZigLLVMTargetMachineEmitPartitionedObjects(
+                target_machine,
+                module,
+                &emit_error_message,
+                &emit_options,
+                partition_count,
+                @max(partitioned.max_threads, 1),
+                c_paths.ptr,
+            )) {
+                try renderEmitError(gpa, config.output_path, std.mem.span(emit_error_message), config.report_config);
+                externs.LLVMDisposeMessage(emit_error_message);
+                return false;
+            }
+            partitioned.object_paths.* = paths;
+            std.log.debug("Compiled bitcode to {d} object files", .{partition_count});
+            return true;
+        }
+        const paths = try partitioned.arena.alloc([]const u8, 1);
+        paths[0] = try partitioned.arena.dupe(u8, config.output_path);
+        partitioned.object_paths.* = paths;
+    }
 
     const emit_result = externs.ZigLLVMTargetMachineEmitToFile(
         target_machine,

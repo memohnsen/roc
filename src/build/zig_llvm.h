@@ -121,6 +121,18 @@ ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitObjectToMemory(LLVMTargetMachineRef ta
 
 ZIG_EXTERN_C void ZigLLVMFreeEmittedObject(char *bytes);
 
+// How many parts `ZigLLVMTargetMachineEmitPartitionedObjects` splits this module into:
+// 1 when it must stay whole (debug info, sanitizers, LTO, extra outputs) or is small.
+ZIG_EXTERN_C size_t ZigLLVMPartitionCount(LLVMModuleRef module_ref, const struct ZigLLVMEmitOptions *options);
+
+// Optimizes and code-generates `module_ref` as `partition_count` independent parts on up
+// to `thread_count` threads, writing part i's object file to `object_paths[i]`. Rewrites
+// the module (locals referenced across parts become hidden symbols). Returns true and sets
+// `error_message` on failure, like `ZigLLVMTargetMachineEmitToFile`.
+ZIG_EXTERN_C bool ZigLLVMTargetMachineEmitPartitionedObjects(LLVMTargetMachineRef targ_machine_ref,
+    LLVMModuleRef module_ref, char **error_message, const struct ZigLLVMEmitOptions *options,
+    size_t partition_count, size_t thread_count, const char *const *object_paths);
+
 ZIG_EXTERN_C void ZigLLVMRunGlobalDCE(LLVMModuleRef module_ref);
 
 ZIG_EXTERN_C LLVMTargetMachineRef ZigLLVMCreateTargetMachine(LLVMTargetRef T, const char *Triple,
