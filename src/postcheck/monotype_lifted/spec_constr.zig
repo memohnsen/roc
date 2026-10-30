@@ -1309,6 +1309,14 @@ const InlineCallMode = enum {
 /// long fusion chains can still inline transitively through many small bodies.
 const spec_constr_body_expr_threshold: usize = 200;
 
+/// The largest callee body, in expressions, SpecConstr inlines for
+/// productivity alone (`Cloner.productiveInlineFits`). On Atlas's desktop UI
+/// built with `--opt=speed`, 50 kept the runtime gain of productive inlining
+/// (138.5 ms against 139.0 ms without a bound, 142.2 ms without productive
+/// inlining) while its peak memory fell from 26.9 GiB to 4.9 GiB before LLVM;
+/// 100 already blew up again (23.2 GiB).
+const spec_constr_productive_inline_body_limit: usize = 50;
+
 /// Maximum number of constructor-call-pattern workers for one source function.
 /// Additional patterns keep the ordinary shared call, bounding generated worker
 /// count without changing any shape proof.
@@ -12693,7 +12701,20 @@ const Cloner = struct {
         // local the context does not have, so the call cannot stay residual
         // and must inline.
         if (self.callCapturesAreForeign(call.captures)) return true;
+        if (!self.productiveInlineFits(callee)) return false;
         return self.directInlineIsProductive(expr_id, callee, call);
+    }
+
+    /// Whether `callee` is small enough to inline for productivity. Every such
+    /// inline copies the callee's body into the caller, and the passes after
+    /// SpecConstr pay for each copy: without a bound, Atlas's desktop UI built
+    /// with `--opt=speed` peaked at 26.7 GiB instead of 8.2 GiB and took 2.4
+    /// times as long, for code 2.6% faster.
+    fn productiveInlineFits(self: *const Cloner, callee: Ast.FnId) bool {
+        const raw: usize = @backingInt(callee);
+        if (raw >= self.pass.plans.len) return false;
+        const size = self.pass.plans[raw].source.size.exactValue() orelse return false;
+        return size <= spec_constr_productive_inline_body_limit;
     }
 
     fn productivity(self: *const Cloner) *const InlineProductivity.Analysis {
