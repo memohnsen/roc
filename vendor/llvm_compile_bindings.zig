@@ -201,6 +201,8 @@ pub const TargetMachine = opaque {
         coverage: Coverage,
         no_target_libcalls: bool,
         lower_memory_intrinsics_to_loops: bool,
+        optimize_threads: c_uint,
+        object_parts_written: ?*c_uint,
 
         pub const LtoPhase = enum(c_int) {
             None,
@@ -433,6 +435,8 @@ pub fn compileBitcodeToObject(
         .coverage = default_coverage,
         .no_target_libcalls = false,
         .lower_memory_intrinsics_to_loops = false,
+        .optimize_threads = 1,
+        .object_parts_written = null,
     };
 
     // Emit object file with the target's own memory intrinsic expansion

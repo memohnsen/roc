@@ -88,6 +88,14 @@ struct ZigLLVMEmitOptions {
     ZigLLVMCoverageOptions coverage;
     bool no_target_libcalls;
     bool lower_memory_intrinsics_to_loops;
+    // Optimize the module on this many threads, in parts after inlining; 0 or
+    // 1 keeps it whole. See `optimizeInParts` in zig_llvm.cpp.
+    unsigned optimize_threads;
+    // When not null and the module is optimized in parts, each part becomes
+    // its own object: the first is written to `bin_filename`, part `i` to
+    // `<bin_filename>.<i>.o`, and the part count is stored here. When null,
+    // the parts are linked back into one module and emitted as one object.
+    unsigned *object_parts_written;
 };
 
 // synchronize with llvm/include/Object/Archive.h::Object::Archive::Kind
