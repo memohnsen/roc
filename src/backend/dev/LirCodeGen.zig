@@ -8877,7 +8877,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 const source_local: LocalId, const offset: u32 = switch (assign.op.kind) {
                     .local, .nominal => .{ assign.op.source, 0 },
                     .field => .{ assign.op.source, self.projectedFieldOffset(assign.op.source, assign.op.index, assign.target) orelse continue },
-                    else => continue,
+                    // These read a different representation of the source, so
+                    // the target keeps storage of its own.
+                    .discriminant, .tag_payload, .tag_payload_struct, .list_reinterpret => continue,
                 };
                 const target_index = plan.localIndex(assign.target).?;
                 const source = plan.localIndex(source_local).?;
@@ -8929,9 +8931,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     try self.setLocalLocation(localKey(v.local), root_loc);
                 } else {
                     // A field has its own layout even at offset 0.
-                    // Only a struct of represented bytes projects a field, so
-                    // its root is a plain stack slot.
-                    const root_offset = frameOffsetOf(root_loc) orelse unreachable;
+                    const root_offset = frameOffsetOf(root_loc) orelse unreachable; // only a struct of represented bytes projects a field, so its root is a plain stack slot
                     try self.setLocalLocation(localKey(v.local), self.stackLocationForLayout(self.localLayout(v.local), root_offset + @as(i32, @intCast(offset))));
                 }
             }
@@ -8956,26 +8956,26 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             }
             const ls = self.layout_store;
             for (stmts) |id| {
-                switch (self.store.getCFStmt(id)) {
-                    .assign_struct => |s| {
-                        const struct_layout = ls.getLayout(self.localLayout(s.target));
-                        if (struct_layout.tag != .struct_) continue;
-                        const struct_idx = struct_layout.getStruct().idx;
-                        const fields = self.store.getLocalSpan(s.fields);
-                        for (0..fields.len) |i| {
-                            self.placeOperand(plan, alias_links, reads, GuardedList.at(fields, i), s.target, ls.getStructFieldOffsetByOriginalIndex(struct_idx, @intCast(i)), ls.getStructFieldLayoutByOriginalIndex(struct_idx, @intCast(i)));
-                        }
-                    },
-                    .assign_tag => |t| {
-                        const payload = t.payload orelse continue;
-                        const union_layout = ls.getLayout(self.localLayout(t.target));
-                        if (union_layout.tag != .tag_union) continue;
-                        const variants = ls.getTagUnionVariants(ls.getTagUnionData(union_layout.getTagUnion().idx));
-                        if (@as(usize, t.variant_index) >= variants.len) continue;
-                        // `generateTag` stores the payload at offset 0.
-                        self.placeOperand(plan, alias_links, reads, payload, t.target, 0, variants.get(t.variant_index).payload_layout);
-                    },
-                    else => {},
+                // Only a record or tag built from its operands can hold them in place.
+                const stmt = self.store.getCFStmt(id);
+                if (stmt == .assign_struct) {
+                    const s = stmt.assign_struct;
+                    const struct_layout = ls.getLayout(self.localLayout(s.target));
+                    if (struct_layout.tag != .struct_) continue;
+                    const struct_idx = struct_layout.getStruct().idx;
+                    const fields = self.store.getLocalSpan(s.fields);
+                    for (0..fields.len) |i| {
+                        self.placeOperand(plan, alias_links, reads, GuardedList.at(fields, i), s.target, ls.getStructFieldOffsetByOriginalIndex(struct_idx, @intCast(i)), ls.getStructFieldLayoutByOriginalIndex(struct_idx, @intCast(i)));
+                    }
+                } else if (stmt == .assign_tag) {
+                    const t = stmt.assign_tag;
+                    const payload = t.payload orelse continue;
+                    const union_layout = ls.getLayout(self.localLayout(t.target));
+                    if (union_layout.tag != .tag_union) continue;
+                    const variants = ls.getTagUnionVariants(ls.getTagUnionData(union_layout.getTagUnion().idx));
+                    if (@as(usize, t.variant_index) >= variants.len) continue;
+                    // `generateTag` stores the payload at offset 0.
+                    self.placeOperand(plan, alias_links, reads, payload, t.target, 0, variants.get(t.variant_index).payload_layout);
                 }
             }
         }
@@ -13888,21 +13888,25 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                 const loc = owner.local_locations.get(localKey(local)) orelse return false;
                 const at = frameOffsetOf(loc) orelse return false;
                 const ls = owner.layout_store;
-                switch (check.stmt) {
-                    .assign_struct => |s| {
-                        const struct_layout = ls.getLayout(owner.localLayout(s.target));
-                        if (struct_layout.tag != .struct_) return false;
-                        const struct_idx = struct_layout.getStruct().idx;
-                        const fields = owner.store.getLocalSpan(s.fields);
-                        for (0..fields.len) |i| {
-                            if (GuardedList.at(fields, i) != local) continue;
-                            return at == check.start + @as(i32, @intCast(ls.getStructFieldOffsetByOriginalIndex(struct_idx, @intCast(i))));
-                        }
-                        return false;
-                    },
-                    .assign_tag => |t| return t.payload == local and at == check.start,
-                    else => return false,
+                // Only an aggregate built in place holds operands where it
+                // stores them; every other statement reads them elsewhere.
+                if (check.stmt == .assign_struct) {
+                    const s = check.stmt.assign_struct;
+                    const struct_layout = ls.getLayout(owner.localLayout(s.target));
+                    if (struct_layout.tag != .struct_) return false;
+                    const struct_idx = struct_layout.getStruct().idx;
+                    const fields = owner.store.getLocalSpan(s.fields);
+                    for (0..fields.len) |i| {
+                        if (GuardedList.at(fields, i) != local) continue;
+                        return at == check.start + @as(i32, @intCast(ls.getStructFieldOffsetByOriginalIndex(struct_idx, @intCast(i))));
+                    }
+                    return false;
                 }
+                if (check.stmt == .assign_tag) {
+                    const t = check.stmt.assign_tag;
+                    return t.payload == local and at == check.start;
+                }
+                return false;
             }
 
             fn noteDef(check: *@This(), local: LocalId) void {
@@ -18079,10 +18083,11 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// values the register pool does not track, such as incoming float
         /// arguments while parameters are bound, so the argument and return
         /// registers are never borrowed even when the pool reports them free.
-        const copy_vector_mask: u32 = switch (arch) {
-            .x86_64 => if (target.isWindows()) 0x30 else 0xFF00, // XMM4-5; XMM8-15
-            else => 0xFFFF0000, // V16-V31
-        };
+        /// LirCodeGen admits only x86_64 and aarch64 (the @compileError at its top).
+        const copy_vector_mask: u32 = if (arch == .x86_64)
+            (if (target.isWindows()) 0x30 else 0xFF00) // XMM4-5; XMM8-15
+        else
+            0xFFFF0000; // V16-V31
 
         fn allocCopyVector(self: *Self) ?FloatReg {
             const candidates = self.codegen.free_float & copy_vector_mask;

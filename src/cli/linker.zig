@@ -362,12 +362,8 @@ fn appendElfSharedLibraryVersionScript(
     if (config.output_kind != .shared_lib or config.target_format != .elf) return;
     if (config.export_symbols.len == 0) return;
 
-    const scratch_dir = config.scratch_dir orelse {
-        if (builtin.mode == .debug) {
-            base.invariant("linker invariant violated: an ELF shared library link has no scratch directory for its version script", .{});
-        }
-        unreachable;
-    };
+    const scratch_dir = config.scratch_dir orelse
+        base.invariant("linker invariant violated: an ELF shared library link has no scratch directory for its version script", .{});
     const script = try elfExportVersionScript(ctx.arena, config.export_symbols);
     const script_path = std.fs.path.join(ctx.arena, &.{ scratch_dir, "exports.map" }) catch return LinkError.OutOfMemory;
     backend.writeFileWindowsAvSafe(ctx.io.std_io, script_path, script) catch return LinkError.LinkFailed;
