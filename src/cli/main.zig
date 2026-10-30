@@ -8630,7 +8630,9 @@ fn writeOptimizedPacks(
     target: RocTarget,
 ) CliMainError!void {
     if (comptime !llvm_available) return;
-    if (args.no_cache or args.fuzz) return;
+    // `--no-dev-packs`: no dev build will read this cache, so the second
+    // lowering and the packs it writes would be wasted.
+    if (args.no_cache or args.fuzz or args.no_dev_packs) return;
     const placement = pack_store.programPackPlacement(build_env, root_artifact) orelse return;
     var store = pack_store.Store.init(ctx.gpa, .{ .enabled = true, .verbose = args.verbose, .roc_ctx = ctx.coreCtx() }, target, @tagName(args.opt)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

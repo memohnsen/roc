@@ -227,6 +227,7 @@ pub const BuildArgs = struct {
     debug: bool = false, // include debug information in the output binary
     fuzz: bool = false, // add libFuzzer no-link coverage instrumentation to LLVM output
     keep_temp: bool = false, // do not delete temporary directories created during build
+    no_dev_packs: bool = false, // skip filing object packs for later dev builds after an optimized build
     verbose: bool = false, // enable verbose output including cache statistics
     timings: bool = false, // always show the per-phase timing breakdown
     no_cache: bool = false, // disable compilation caching
@@ -834,6 +835,7 @@ const commands = [_]Command{
             .{ .name = "--verbose", .field = "verbose", .help = "Enable verbose output including cache statistics" },
             .{ .name = "--timings", .field = "timings", .help = "Show how long each compilation phase took (shown automatically when a build is slow)" },
             .{ .name = "--no-cache", .field = "no_cache", .help = "Disable compilation caching" },
+            .{ .name = "--no-dev-packs", .field = "no_dev_packs", .help = "After an optimized build, skip filing object packs for later dev builds" },
             .{ .name = "--watch", .field = "watch", .help = "Rebuild when source inputs change" },
             watch_inputs_file_flag,
             jobs_flag,
@@ -1766,6 +1768,12 @@ test "roc build" {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "build", "--keep-temp" });
         defer result.deinit(gpa);
         try testing.expect(result.build.keep_temp);
+        try testing.expect(!result.build.no_dev_packs);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "build", "--opt=speed", "--no-dev-packs" });
+        defer result.deinit(gpa);
+        try testing.expect(result.build.no_dev_packs);
     }
 }
 
@@ -3126,6 +3134,7 @@ test "golden help: roc build --help" {
         \\      --verbose                      Enable verbose output including cache statistics
         \\      --timings                      Show how long each compilation phase took (shown automatically when a build is slow)
         \\      --no-cache                     Disable compilation caching
+        \\      --no-dev-packs                 After an optimized build, skip filing object packs for later dev builds
         \\      --watch                        Rebuild when source inputs change
         \\  -j, --jobs=<N>                     Max worker threads for parallel compilation (default: auto-detect CPU count)
         \\      --wasm-memory=<bytes>          Initial memory size for WASM targets in bytes (default: sized from data segments plus the stack)
