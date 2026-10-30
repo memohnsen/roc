@@ -14054,7 +14054,7 @@ test "runtime specialization strategy helpers" {
 test "post-check optimization scope per opt level" {
     try std.testing.expectEqual(lir.CheckedPipeline.InlineMode.wrappers, postCheckInlineModeForOpt(.speed));
     try std.testing.expectEqual(lir.CheckedPipeline.InlineMode.wrappers, postCheckInlineModeForOpt(.size));
-    try std.testing.expectEqual(lir.CheckedPipeline.InlineMode.procedures, postCheckInlineModeForOpt(.dev));
+    try std.testing.expectEqual(lir.CheckedPipeline.InlineMode.wrappers_and_source_single_use, postCheckInlineModeForOpt(.dev));
     try std.testing.expectEqual(lir.CheckedPipeline.InlineMode.none, postCheckInlineModeForOpt(.interpreter));
     try std.testing.expectEqual(lir.CheckedPipeline.SpecConstrCloneInlining.all_calls, specConstrCloneInliningForOpt(.speed));
     try std.testing.expectEqual(lir.CheckedPipeline.SpecConstrCloneInlining.all_calls, specConstrCloneInliningForOpt(.size));

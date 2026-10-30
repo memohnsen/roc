@@ -38,11 +38,17 @@ pub const OptLevel = enum {
     }
 };
 
-/// The post-check inliner's mode at `opt`.
+/// The post-check inliner's mode at `opt`. Dev builds inline wrappers and
+/// bodies their module's source calls at exactly one site. Both depend only on
+/// source, so every program still inlines the same calls and a cached dev
+/// procedure stays valid in any program that links it. Upstream's
+/// `dev_inline_mode` (`.procedures`) keeps every procedure standalone instead,
+/// which made dev code about 17% slower on a large UI; the compile-time
+/// evaluator keeps that policy.
 pub fn postCheckInlineModeForOpt(opt: OptLevel) lir.CheckedPipeline.InlineMode {
     return switch (opt) {
         .size, .speed => .wrappers,
-        .dev => lir.CheckedPipeline.dev_inline_mode,
+        .dev => .wrappers_and_source_single_use,
         .interpreter => .none,
     };
 }
