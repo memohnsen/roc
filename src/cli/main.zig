@@ -10645,6 +10645,9 @@ const LlvmObjectPaths = struct {
     artifact_dir: []const u8,
     bitcode_path: []const u8,
     object_path: []const u8,
+    /// The objects of a program LLVM optimized in parts, after the first at
+    /// `object_path`; every one is linked with it.
+    extra_object_paths: []const []const u8 = &.{},
 };
 
 fn staticDataLinkRootSymbols(
@@ -11043,6 +11046,9 @@ fn compileLlvmAppObject(
         std.log.err("Failed to write LLVM bitcode {s}: {}", .{ bitcode_path, err });
         return err;
     };
+    // LLVM reads the file back; free this copy before LLVM's peak.
+    bitcode.deinit();
+    bitcode.bitcode = &.{};
 
     // Bitcode is generated; the remaining work is LLVM's optimization pipeline
     // and object emission, which dominates large builds and warrants its own row.
@@ -11051,6 +11057,7 @@ fn compileLlvmAppObject(
         r.begin("LLVM Optimize + Emit");
     }
 
+    var object_parts: c_uint = 1;
     const compile_config = builder.CompileConfig{
         .input_path = bitcode_path,
         .output_path = object_path,
@@ -11071,6 +11078,11 @@ fn compileLlvmAppObject(
         .pic = pic,
         .no_target_libcalls = noTargetLibcallsForLlvmBuild(target),
         .private_runtime = true,
+        // LLVM optimizes the program in parts on one thread per worker
+        // (zig_llvm.cpp `optimizeInParts`).
+        .optimize_threads = @intCast(@min(resolveThreadDefaults(args.max_threads)[0], std.math.maxInt(u32))),
+        // A native link takes every part's object; wasm combines one object.
+        .object_parts_out = if (target.toCpuArch() == .wasm32) null else &object_parts,
     };
 
     const success = try builder.compileBitcodeToObject(ctx.gpa, ctx.io.std_io, compile_config);
@@ -11079,10 +11091,15 @@ fn compileLlvmAppObject(
         return error.LLVMCompilationFailed;
     }
 
+    const extra_object_paths = try ctx.arena.alloc([]const u8, @max(object_parts, 1) - 1);
+    for (extra_object_paths, 1..) |*path, part| {
+        path.* = try std.fmt.allocPrint(ctx.arena, "{s}.{d}.o", .{ object_path, part });
+    }
     return .{
         .artifact_dir = artifact_dir,
         .bitcode_path = bitcode_path,
         .object_path = object_path,
+        .extra_object_paths = extra_object_paths,
     };
 }
 
@@ -11635,6 +11652,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResult
 
         var object_files = try std.array_list.Managed([]const u8).initCapacity(ctx.arena, 4);
         try object_files.append(app_object.object_path);
+        try object_files.appendSlice(app_object.extra_object_paths);
         if (static_data_obj_path) |path| {
             try object_files.append(path);
         }

@@ -27,6 +27,14 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/OptBisect.h>
+#include <atomic>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Linker/Linker.h>
+#include <llvm/Support/thread.h>
+#include <llvm/Transforms/IPO/Annotation2Metadata.h>
+#include <llvm/Transforms/IPO/ForceFunctionAttrs.h>
+#include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/Utils/SplitModule.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/InitializePasses.h>
@@ -323,38 +331,23 @@ static bool openEmitFile(const char *filename, std::unique_ptr<raw_fd_ostream> &
     return false;
 }
 
-// Runs the optimization and code generation pipeline, writing the object (or
-// LTO bitcode) to `dest_bin` when it is non-null. The assembly and bitcode
-// outputs named in `options` are written to their files.
-static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
-    char **error_message, const ZigLLVMEmitOptions *options, raw_pwrite_stream *dest_bin,
-    const char *time_trace_name)
+// How much of the optimizer `optimizeModule` runs.
+enum class OptimizeStage {
+    // LLVM's whole per-module pipeline, then a second vectorization attempt.
+    whole,
+    // The front of that pipeline: inlining and per-function simplification
+    // (LLVM's module simplification pipeline).
+    simplify,
+    // The rest after `simplify`: LLVM's module optimization pipeline and the
+    // second vectorization attempt.
+    finish,
+};
+
+// Optimizes `llvm_module` for `target_machine`, the part of the pipeline
+// `stage` names. Returns true and sets `error_message` on failure.
+static bool optimizeModule(TargetMachine &target_machine, Module &llvm_module,
+    const ZigLLVMEmitOptions *options, OptimizeStage stage, char **error_message)
 {
-    TimePassesIsEnabled = options->time_report_out != nullptr;
-
-    std::unique_ptr<raw_fd_ostream> dest_asm, dest_bitcode;
-    if (openEmitFile(options->asm_filename, dest_asm, error_message)) return true;
-    if (openEmitFile(options->bitcode_filename, dest_bitcode, error_message)) return true;
-
-    auto PID = sys::Process::getProcessId();
-    std::string ProcName = "zig-";
-    ProcName += std::to_string(PID);
-    TimeTracerRAII TimeTracer(ProcName, time_trace_name);
-
-    TargetMachine &target_machine = *reinterpret_cast<TargetMachine*>(targ_machine_ref);
-
-    if (options->allow_fast_isel) {
-        target_machine.setO0WantsFastISel(true);
-    } else {
-        target_machine.setFastISel(false);
-    }
-
-    if (!options->allow_machine_outliner) {
-        target_machine.setMachineOutliner(false);
-    }
-
-    Module &llvm_module = *unwrap(module_ref);
-
     // Pipeline configurations
     const OptimizationLevel opt_level = toLLVMOptimizationLevel(options->ir_opt_level);
     PipelineTuningOptions pipeline_opts;
@@ -487,35 +480,26 @@ static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleR
     });
 
     ModulePassManager module_pm;
-    // Initialize the PassManager
     if (opt_level == OptimizationLevel::O0) {
       module_pm = pass_builder.buildO0DefaultPipeline(opt_level, static_cast<ThinOrFullLTOPhase>(options->lto));
     } else if (options->lto) {
       module_pm = pass_builder.buildLTOPreLinkDefaultPipeline(opt_level);
-    } else {
+    } else if (stage == OptimizeStage::whole) {
       module_pm = pass_builder.buildPerModuleDefaultPipeline(opt_level);
+    } else if (stage == OptimizeStage::simplify) {
+      // The front of `buildPerModuleDefaultPipeline`.
+      module_pm.addPass(Annotation2MetadataPass());
+      module_pm.addPass(ForceFunctionAttrsPass());
+      pass_builder.invokePipelineStartEPCallbacks(module_pm, opt_level);
+      module_pm.addPass(pass_builder.buildModuleSimplificationPipeline(opt_level, ThinOrFullLTOPhase::None));
+    } else {
+      module_pm = pass_builder.buildModuleOptimizationPipeline(opt_level, ThinOrFullLTOPhase::None);
     }
 
-    // Unfortunately we don't have new PM for code generation
-    legacy::PassManager codegen_pm;
-    codegen_pm.add(
-      createTargetTransformInfoWrapperPass(target_machine.getTargetIRAnalysis()));
-
-    if (dest_bin && !options->lto) {
-        if (target_machine.addPassesToEmitFile(codegen_pm, *dest_bin, nullptr, CodeGenFileType::ObjectFile)) {
-            *error_message = strdup("TargetMachine can't emit an object file");
-            return true;
-        }
-    }
-    if (dest_asm) {
-        if (target_machine.addPassesToEmitFile(codegen_pm, *dest_asm, nullptr, CodeGenFileType::AssemblyFile)) {
-            *error_message = strdup("TargetMachine can't emit an assembly file");
-            return true;
-        }
-    }
-
-    // Optimization phase
     module_pm.run(llvm_module, module_am);
+    if (stage == OptimizeStage::simplify) {
+        return false;
+    }
 
     // A second vectorization attempt. Roc emits list bounds and uniqueness
     // checks as ordinary calls, so a loop that will end up as pure lane
@@ -566,8 +550,258 @@ static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleR
         }
     }
 
+    return false;
+}
+
+// Optimizes `llvm_module` in `parts` pieces at once and links them into
+// `merged`, which code generation then emits in its place. LLVM contexts are
+// not thread-safe, so each piece crosses to its worker as bitcode and is
+// optimized in a context of its own. Splitting makes the module's private
+// symbols external so the pieces can reach each other; the merged module gets
+// their original linkage back, and global DCE then drops any that only another
+// piece needed before inlining removed the use.
+// With `objects`, each worker also generates its part's code and leaves the
+// object in `objects` instead: nothing is merged and code generation runs on
+// every worker too.
+static bool optimizeInParts(TargetMachine &target_machine, Module &llvm_module,
+    const ZigLLVMEmitOptions *options, unsigned parts, unsigned threads, OptimizeStage stage,
+    std::unique_ptr<Module> &merged, std::vector<SmallVector<char, 0>> *objects, char **error_message)
+{
+    std::vector<std::pair<std::string, GlobalValue::LinkageTypes>> private_symbols;
+    for (GlobalValue &value : llvm_module.global_values()) {
+        if (value.hasLocalLinkage() && value.hasName()) {
+            private_symbols.emplace_back(value.getName().str(), value.getLinkage());
+        }
+    }
+
+    std::vector<SmallVector<char, 0>> inputs;
+    SplitModule(llvm_module, parts, [&](std::unique_ptr<Module> part) {
+        SmallVector<char, 0> &buffer = inputs.emplace_back();
+        raw_svector_ostream stream(buffer);
+        WriteBitcodeToFile(*part, stream);
+    }, /*PreserveLocals=*/false);
+    // The pieces carry every body now; free the caller's copies while the
+    // workers run. `deleteBody` leaves an external declaration behind.
+    for (Function &function : llvm_module) {
+        function.deleteBody();
+    }
+
+    std::vector<SmallVector<char, 0>> outputs(inputs.size());
+    std::vector<std::string> errors(inputs.size());
+    if (objects != nullptr) {
+        objects->assign(inputs.size(), SmallVector<char, 0>());
+    }
+    {
+        // Workers take parts in order until none are left. More parts than
+        // threads keeps less of the program in memory at once: only the parts
+        // being worked on are, and smaller parts carry smaller peaks.
+        auto process = [&](size_t index) {
+                LLVMContext context;
+                Expected<std::unique_ptr<Module>> parsed = parseBitcodeFile(
+                    MemoryBufferRef(StringRef(inputs[index].data(), inputs[index].size()), "part"), context);
+                if (!parsed) {
+                    errors[index] = toString(parsed.takeError());
+                    return;
+                }
+                std::unique_ptr<Module> part = std::move(*parsed);
+                inputs[index] = SmallVector<char, 0>();
+                std::unique_ptr<TargetMachine> part_machine(target_machine.getTarget().createTargetMachine(
+                    target_machine.getTargetTriple(), target_machine.getTargetCPU(),
+                    target_machine.getTargetFeatureString(), target_machine.Options,
+                    target_machine.getRelocationModel(), target_machine.getCodeModel(),
+                    target_machine.getOptLevel()));
+                if (!part_machine) {
+                    errors[index] = "cannot create a target machine for an optimization worker";
+                    return;
+                }
+                char *part_error = nullptr;
+                if (optimizeModule(*part_machine, *part, options, stage, &part_error)) {
+                    errors[index] = part_error != nullptr ? part_error : "optimization failed";
+                    free(part_error);
+                    return;
+                }
+                if (objects != nullptr) {
+                    // The same code generator settings `emitWithBinStream` gives the
+                    // whole module's machine.
+                    part_machine->setFastISel(false);
+                    if (!options->allow_machine_outliner) {
+                        part_machine->setMachineOutliner(false);
+                    }
+                    legacy::PassManager codegen_pm;
+                    codegen_pm.add(createTargetTransformInfoWrapperPass(part_machine->getTargetIRAnalysis()));
+                    raw_svector_ostream object_stream((*objects)[index]);
+                    if (part_machine->addPassesToEmitFile(codegen_pm, object_stream, nullptr, CodeGenFileType::ObjectFile)) {
+                        errors[index] = "TargetMachine can't emit an object file";
+                        return;
+                    }
+                    codegen_pm.run(*part);
+                    return;
+                }
+                raw_svector_ostream stream(outputs[index]);
+                WriteBitcodeToFile(*part, stream);
+        };
+        std::atomic<size_t> next_part{0};
+        std::vector<llvm::thread> workers;
+        const size_t thread_count = std::min<size_t>(threads, inputs.size());
+        for (size_t thread = 0; thread < thread_count; thread++) {
+            // Large procedures recurse deeply in some passes; give each worker
+            // the stack a main thread would have.
+            workers.emplace_back(std::optional<unsigned>(256u << 20), [&] {
+                for (size_t index = next_part.fetch_add(1); index < inputs.size(); index = next_part.fetch_add(1)) {
+                    process(index);
+                }
+            });
+        }
+        for (llvm::thread &worker : workers) {
+            worker.join();
+        }
+    }
+    inputs.clear();
+    for (const std::string &error : errors) {
+        if (!error.empty()) {
+            *error_message = strdup(error.c_str());
+            return true;
+        }
+    }
+    if (objects != nullptr) {
+        return false;
+    }
+
+    merged = std::make_unique<Module>(llvm_module.getModuleIdentifier(), llvm_module.getContext());
+    merged->setDataLayout(llvm_module.getDataLayout());
+    merged->setTargetTriple(llvm_module.getTargetTriple());
+    Linker linker(*merged);
+    for (SmallVector<char, 0> &output : outputs) {
+        Expected<std::unique_ptr<Module>> parsed = parseBitcodeFile(
+            MemoryBufferRef(StringRef(output.data(), output.size()), "optimized part"), llvm_module.getContext());
+        if (!parsed) {
+            *error_message = strdup(toString(parsed.takeError()).c_str());
+            return true;
+        }
+        if (linker.linkInModule(std::move(*parsed))) {
+            *error_message = strdup("cannot link the optimized parts back together");
+            return true;
+        }
+        output = SmallVector<char, 0>();
+    }
+
+    for (const auto &[name, linkage] : private_symbols) {
+        GlobalValue *value = merged->getNamedValue(name);
+        if (value != nullptr && !value->isDeclaration()) {
+            value->setVisibility(GlobalValue::DefaultVisibility);
+            value->setLinkage(linkage);
+        }
+    }
+    ModulePassManager dce_pm;
+    ModuleAnalysisManager dce_am;
+    PassBuilder dce_builder;
+    dce_builder.registerModuleAnalyses(dce_am);
+    dce_pm.addPass(GlobalDCEPass());
+    dce_pm.run(*merged, dce_am);
+    return false;
+}
+
+// Runs the optimization and code generation pipeline, writing the object (or
+// LTO bitcode) to `dest_bin` when it is non-null. The assembly and bitcode
+// outputs named in `options` are written to their files.
+static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
+    char **error_message, const ZigLLVMEmitOptions *options, raw_pwrite_stream *dest_bin,
+    const char *time_trace_name)
+{
+    TimePassesIsEnabled = options->time_report_out != nullptr;
+
+    std::unique_ptr<raw_fd_ostream> dest_asm, dest_bitcode;
+    if (openEmitFile(options->asm_filename, dest_asm, error_message)) return true;
+    if (openEmitFile(options->bitcode_filename, dest_bitcode, error_message)) return true;
+
+    auto PID = sys::Process::getProcessId();
+    std::string ProcName = "zig-";
+    ProcName += std::to_string(PID);
+    TimeTracerRAII TimeTracer(ProcName, time_trace_name);
+
+    TargetMachine &target_machine = *reinterpret_cast<TargetMachine*>(targ_machine_ref);
+
+    if (options->allow_fast_isel) {
+        target_machine.setO0WantsFastISel(true);
+    } else {
+        target_machine.setFastISel(false);
+    }
+
+    if (!options->allow_machine_outliner) {
+        target_machine.setMachineOutliner(false);
+    }
+
+    Module &llvm_module = *unwrap(module_ref);
+
+    const OptimizationLevel opt_level = toLLVMOptimizationLevel(options->ir_opt_level);
+
+    // Unfortunately we don't have new PM for code generation
+    legacy::PassManager codegen_pm;
+    codegen_pm.add(
+      createTargetTransformInfoWrapperPass(target_machine.getTargetIRAnalysis()));
+
+    if (dest_bin && !options->lto) {
+        if (target_machine.addPassesToEmitFile(codegen_pm, *dest_bin, nullptr, CodeGenFileType::ObjectFile)) {
+            *error_message = strdup("TargetMachine can't emit an object file");
+            return true;
+        }
+    }
+    if (dest_asm) {
+        if (target_machine.addPassesToEmitFile(codegen_pm, *dest_asm, nullptr, CodeGenFileType::AssemblyFile)) {
+            *error_message = strdup("TargetMachine can't emit an assembly file");
+            return true;
+        }
+    }
+
+    // `optimize_threads` names the threads; each gets this many parts. More
+    // parts than threads keeps less of the program in memory at once (see
+    // `optimizeInParts`): on Atlas's desktop UI, four per thread kept the
+    // parts below the whole-module simplification's peak.
+    const unsigned threads = options->optimize_threads;
+    const unsigned parts_per_thread = 4;
+
+    // Splitting needs a whole optimized object as the only output.
+    const bool split = threads > 1 && opt_level != OptimizationLevel::O0 && !options->lto && dest_bin != nullptr &&
+        !dest_asm && !dest_bitcode && options->llvm_ir_filename == nullptr && !options->sancov && !options->tsan &&
+        !TimePassesIsEnabled;
+    Module *codegen_module = &llvm_module;
+    std::unique_ptr<Module> merged;
+    if (split) {
+        // Inlining needs the whole module: a call across parts could not be
+        // inlined, and the stock UI ran 3x slower split before it. The rest of
+        // the pipeline works within each function or each part, and part of it
+        // grows faster than the module, so it runs in parts.
+        if (optimizeModule(target_machine, llvm_module, options, OptimizeStage::simplify, error_message)) return true;
+        const bool separate_objects = options->object_parts_written != nullptr && options->bin_filename != nullptr;
+        std::vector<SmallVector<char, 0>> objects;
+        if (optimizeInParts(target_machine, llvm_module, options, threads * parts_per_thread, threads, OptimizeStage::finish, merged,
+                separate_objects ? &objects : nullptr, error_message)) {
+            return true;
+        }
+        if (separate_objects) {
+            // Part 0 is the caller's object; every other part gets its own file
+            // beside it, which the caller links with it.
+            dest_bin->write(objects[0].data(), objects[0].size());
+            for (size_t index = 1; index < objects.size(); index++) {
+                std::string path = std::string(options->bin_filename) + "." + std::to_string(index) + ".o";
+                std::error_code error_code;
+                raw_fd_ostream part_file(path, error_code, sys::fs::OF_None);
+                if (error_code) {
+                    *error_message = strdup(error_code.message().c_str());
+                    return true;
+                }
+                part_file.write(objects[index].data(), objects[index].size());
+            }
+            *options->object_parts_written = static_cast<unsigned>(objects.size());
+            return false;
+        }
+        codegen_module = merged.get();
+    } else {
+        if (optimizeModule(target_machine, llvm_module, options, OptimizeStage::whole, error_message)) return true;
+    }
+
     // Code generation phase
-    codegen_pm.run(llvm_module);
+    codegen_pm.run(*codegen_module);
 
     if (options->llvm_ir_filename) {
         if (LLVMPrintModuleToFile(module_ref, options->llvm_ir_filename, error_message)) {

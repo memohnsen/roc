@@ -655,6 +655,8 @@ fn emitMergedBitcodeModulesToObject(
         .coverage = default_coverage,
         .no_target_libcalls = options.no_target_libcalls,
         .lower_memory_intrinsics_to_loops = options.lower_memory_intrinsics_to_loops,
+        .optimize_threads = 1,
+        .object_parts_written = null,
     };
 
     var emit_error: [*:0]const u8 = undefined;

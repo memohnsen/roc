@@ -95,6 +95,13 @@ pub const CompileConfig = struct {
     pic: bool = false, // Position-independent code (required for shared library output)
     no_target_libcalls: bool = false,
     lower_memory_intrinsics_to_loops: bool = false,
+    /// Optimize the module on this many threads (`--jobs`), in parts after
+    /// inlining; 1 keeps it whole.
+    optimize_threads: u32 = 1,
+    /// When set, a module optimized in parts is written as one object per part:
+    /// the first at `output_path`, part `i` at `<output_path>.<i>.o`; the part
+    /// count lands here. When null, the parts become one object.
+    object_parts_out: ?*c_uint = null,
     /// Link the target's private runtime (src/builtins/llvm_private_runtime.zig),
     /// so every routine LLVM's code generator calls binds to a definition
     /// internal to the object. A target `llvmPrivateRuntimeTarget` names no
@@ -183,6 +190,8 @@ const ZigLLVMEmitOptions = extern struct {
     coverage: ZigLLVMCoverageOptions,
     no_target_libcalls: bool,
     lower_memory_intrinsics_to_loops: bool,
+    optimize_threads: c_uint,
+    object_parts_written: ?*c_uint,
 };
 
 // LLVM Code Generation Optimization Levels
@@ -900,6 +909,8 @@ pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileCon
         .coverage = coverage_options,
         .no_target_libcalls = config.no_target_libcalls,
         .lower_memory_intrinsics_to_loops = config.lower_memory_intrinsics_to_loops,
+        .optimize_threads = config.optimize_threads,
+        .object_parts_written = config.object_parts_out,
     };
 
     const emit_result = externs.ZigLLVMTargetMachineEmitToFile(
