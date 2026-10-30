@@ -10641,6 +10641,13 @@ fn rocBuildWasm(
     try linkWasmOutput(ctx, args, target, link_inputs, final_output_path, obj_path, scratch_dir);
 }
 
+/// Work a caller does once the program's bitcode is on disk and before LLVM
+/// takes it over, such as releasing the lowered program LLVM no longer reads.
+const BeforeLlvm = struct {
+    context: *anyopaque,
+    run: *const fn (context: *anyopaque, artifact_dir: []const u8) CliMainError!void,
+};
+
 const LlvmObjectPaths = struct {
     artifact_dir: []const u8,
     bitcode_path: []const u8,
@@ -10971,6 +10978,7 @@ fn compileLlvmAppObject(
     // LIR-to-bitcode lowering; this transitions it to a distinct
     // "LLVM Optimize + Emit" phase at the point LLVM takes over the bitcode.
     reporter: ?*progress.Reporter,
+    before_llvm: ?BeforeLlvm,
 ) CliMainError!LlvmObjectPaths {
     const std_target = try stdTargetForLlvmBuild(ctx, target);
     const llvm_cpu = llvmCpuNameForTarget(std_target);
@@ -11049,6 +11057,7 @@ fn compileLlvmAppObject(
     // LLVM reads the file back; free this copy before LLVM's peak.
     bitcode.deinit();
     bitcode.bitcode = &.{};
+    if (before_llvm) |hook| try hook.run(hook.context, artifact_dir);
 
     // Bitcode is generated; the remaining work is LLVM's optimization pipeline
     // and object emission, which dominates large builds and warrants its own row.
@@ -11205,6 +11214,7 @@ fn rocBuildWasmLlvm(
         false,
         stack_checks,
         reporter,
+        null,
     );
     defer if (!args.keep_temp) std.Io.Dir.cwd().deleteTree(ctx.io.std_io, app_object.artifact_dir) catch {};
 
@@ -11498,6 +11508,27 @@ fn reportKeptTempDir(ctx: *CliCtx, dir: []const u8) Allocator.Error!void {
     reporting.renderReportToTerminal(&report, ctx.io.stderr(), palette, config) catch {};
 }
 
+/// The native LLVM build's `BeforeLlvm`: it writes the boxy runtime's link
+/// inputs, the last thing the link needs from the lowered program, then frees
+/// the program. On Atlas's desktop UI that program is most of the 3 GiB the
+/// compiler held while LLVM ran.
+const ReleaseLoweredBeforeLlvm = struct {
+    ctx: *CliCtx,
+    lowered: *lir.CheckedPipeline.LoweredProgram,
+    live: *bool,
+    boxy_inputs: *std.array_list.Managed([]const u8),
+    target: RocTarget,
+
+    fn run(context: *anyopaque, artifact_dir: []const u8) CliMainError!void {
+        const self: *ReleaseLoweredBeforeLlvm = @ptrCast(@alignCast(context));
+        if (lirResultNeedsBoxyRuntime(&self.lowered.lir_result)) {
+            try appendBoxyRuntimeLinkInputs(self.ctx, self.boxy_inputs, artifact_dir, self.target, &self.lowered.lir_result, null, null);
+        }
+        self.lowered.deinit();
+        self.live.* = false;
+    }
+};
+
 fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResult {
     const timer_start_ns = std.Io.Timestamp.now(ctx.io.std_io, .awake).nanoseconds;
 
@@ -11584,7 +11615,10 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResult
         reporter.end();
     }
     var lowered = try lowerBuildCommandToLir(ctx, args, &build_env, &reporter, root_artifact, imported_artifacts, relation_artifacts, .linked_output, target, args.synthetic_default_platform, null, .source_bodies);
-    defer lowered.deinit();
+    // A native LLVM build releases the lowered program before LLVM runs
+    // (`ReleaseLoweredBeforeLlvm`), so LLVM's peak does not sit on top of it.
+    var lowered_live = true;
+    defer if (lowered_live) lowered.deinit();
 
     const entrypoints = try nativeBuildEntrypoints(ctx, root_artifact, &lowered);
     defer ctx.gpa.free(entrypoints);
@@ -11617,6 +11651,14 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResult
         const hosted_symbols = try hostedSymbolsFromLir(ctx.arena, &lowered.lir_result.store);
         const enable_default_platform_runtime = args.synthetic_default_platform and EmbeddedTargetObjects.forTarget(target).default_platform != null;
 
+        var boxy_inputs = std.array_list.Managed([]const u8).init(ctx.arena);
+        var release_lowered: ReleaseLoweredBeforeLlvm = .{
+            .ctx = ctx,
+            .lowered = &lowered,
+            .live = &lowered_live,
+            .boxy_inputs = &boxy_inputs,
+            .target = target,
+        };
         const app_object = try compileLlvmAppObject(
             ctx,
             args,
@@ -11629,6 +11671,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResult
             args.synthetic_default_platform,
             false,
             &reporter,
+            .{ .context = &release_lowered, .run = ReleaseLoweredBeforeLlvm.run },
         );
 
         if (args.keep_temp) try reportKeptTempDir(ctx, app_object.artifact_dir);
@@ -11659,9 +11702,7 @@ fn rocBuildLlvm(ctx: *CliCtx, args: cli_args.BuildArgs) CliMainError!BuildResult
         if (enable_default_platform_runtime) {
             try appendDefaultPlatformLinkInputs(ctx, &object_files, app_object.artifact_dir, target);
         }
-        if (lirResultNeedsBoxyRuntime(&lowered.lir_result)) {
-            try appendBoxyRuntimeLinkInputs(ctx, &object_files, app_object.artifact_dir, target, &lowered.lir_result, null, null);
-        }
+        try object_files.appendSlice(boxy_inputs.items);
         reporter.end();
 
         reporter.begin("Linking");
