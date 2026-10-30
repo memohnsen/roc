@@ -14677,7 +14677,14 @@ fn checkedRuntimeLoweringConfig(
             .list_in_place_map = listInPlaceMapForOpt(opt),
             .zero_dict_seed = zeroDictSeedForOpt(opt),
             .site_code_keys = siteCodeKeysForOpt(opt),
-            .owned_proc_signatures = opt == .dev,
+            // ARC infers every procedure's ownership signature, as before
+            // roc-lang/roc#12659: pinning dev procedures to the owned base ABI
+            // keeps them reusable in other programs, but on Atlas's UI its
+            // extra reference counting made dev code about 8% slower. A
+            // procedure that code without a code key can call keeps a stable
+            // signature (`site_code_keys`), so cached code stays correct.
+            // Compile-time evaluation keeps the owned ABI.
+            .owned_proc_signatures = false,
             .tag_reachability = tagReachabilityForOpt(opt),
             .prove_ranges = proveRangesForOpt(opt),
             .reuse_boxes = optimizeLirForOpt(opt),
@@ -14714,7 +14721,7 @@ test "native test generic procedures use the ordinary native dev representation 
     try std.testing.expectEqual(build.target.erased_capture_prefix, tests.target.erased_capture_prefix);
     try std.testing.expectEqual(build.target.target_usize, tests.target.target_usize);
     try std.testing.expectEqual(build.target.inline_expects, tests.target.inline_expects);
-    try std.testing.expect(build.target.owned_proc_signatures);
+    try std.testing.expect(!build.target.owned_proc_signatures);
     try std.testing.expectEqual(lir.CheckedPipeline.CodeProvision.source_bodies, tests.target.code_provision);
     try std.testing.expect(tests.target.spec_cache == null);
 }
