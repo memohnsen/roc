@@ -278,6 +278,7 @@ const llvm_externs = if (llvm_available) struct {
     extern fn LLVMRemoveStringAttributeAtIndex(fn_val: ?*anyopaque, idx: c_uint, name: [*]const u8, len: c_uint) void;
     extern fn LLVMGetEnumAttributeKindForName(name: [*]const u8, len: usize) c_uint;
     extern fn LLVMCreateEnumAttribute(ctx: ?*anyopaque, kind: c_uint, value: u64) ?*anyopaque;
+    extern fn LLVMCreateStringAttribute(ctx: ?*anyopaque, key: [*]const u8, key_len: c_uint, value: [*]const u8, value_len: c_uint) ?*anyopaque;
     extern fn LLVMGetModuleContext(module: ?*anyopaque) ?*anyopaque;
     extern fn LLVMAddAttributeAtIndex(fn_val: ?*anyopaque, idx: c_uint, attr: ?*anyopaque) void;
     extern fn LLVMGetNamedFunction(module: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
@@ -469,6 +470,12 @@ fn linkPrivateRuntime(module: ?*anyopaque, bitcode: []const u8, target_triple_z:
     if (externs.LLVMGetNamedGlobal(runtime_module, "llvm.used")) |used| externs.LLVMDeleteGlobal(used);
     if (externs.LLVMGetNamedGlobal(runtime_module, "llvm.compiler.used")) |compiler_used| externs.LLVMDeleteGlobal(compiler_used);
 
+    // The runtime implements the C routines LLVM recognizes, so its bodies must
+    // never be rewritten into calls to them, as `-fno-builtin` keeps compiler-rt's
+    // own. Without it the optimizer turned the `strlen` loop into a call to
+    // `strlen`, the routine itself, and the arm64 Mac build compiled that
+    // recursion to a trap.
+    const no_builtins_attr = externs.LLVMCreateStringAttribute(externs.LLVMGetModuleContext(runtime_module), "no-builtins", "no-builtins".len, "", 0);
     var func = externs.LLVMGetFirstFunction(runtime_module);
     while (func) |fv| : (func = externs.LLVMGetNextFunction(fv)) {
         if (externs.LLVMIsDeclaration(fv) != 0) continue;
@@ -476,6 +483,7 @@ fn linkPrivateRuntime(module: ?*anyopaque, bitcode: []const u8, target_triple_z:
         // target machine supplies the CPU this object is built for.
         externs.LLVMRemoveStringAttributeAtIndex(fv, LLVMAttributeFunctionIndex, "target-features", "target-features".len);
         externs.LLVMRemoveStringAttributeAtIndex(fv, LLVMAttributeFunctionIndex, "target-cpu", "target-cpu".len);
+        externs.LLVMAddAttributeAtIndex(fv, LLVMAttributeFunctionIndex, no_builtins_attr);
         if (!isPrivateRuntimeRoutine(valueName(fv))) externs.LLVMSetLinkage(fv, LLVMInternalLinkage);
     }
     var global = externs.LLVMGetFirstGlobal(runtime_module);
