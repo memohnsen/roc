@@ -278,6 +278,12 @@ pub const LinkConfig = struct {
     /// containing the running `roc` executable.
     scratch_dir: ?[]const u8 = null,
 
+    /// Whether an ELF shared library exports only `export_symbols`
+    /// (`appendElfSharedLibraryVersionScript`). A fast dev link's host
+    /// prelink (`fast_dev_link.elfLinkConfig`) is not the final library: its
+    /// patch step still needs the host's symbols, so it keeps LLD's defaults.
+    elf_export_only_declared: bool = true,
+
     /// Object file whose `__DWARF` sections get spliced into the linked
     /// macOS executable after linking, making it self-contained for
     /// debuggers. Also suppresses the stabs debug map and reserves load
@@ -389,6 +395,7 @@ fn appendElfSharedLibraryVersionScript(
 ) LinkError!void {
     if (config.output_kind != .shared_lib or config.target_format != .elf) return;
     if (config.export_symbols.len == 0) return;
+    if (!config.elf_export_only_declared) return;
 
     const scratch_dir = config.scratch_dir orelse
         base.invariant("linker invariant violated: an ELF shared library link has no scratch directory for its version script", .{});

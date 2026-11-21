@@ -430,6 +430,7 @@ pub fn elfLinkConfig(spec: *const HostSpec, objects: []const []const u8, output_
         .force_undefined_symbols = spec.keep,
         .platform_files_dir = spec.platform_files_dir,
         .scratch_dir = scratch_dir,
+        .elf_export_only_declared = false,
     };
 }
 
