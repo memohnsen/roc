@@ -69,6 +69,10 @@
 #include <llvm/Support/Timer.h>
 #include <llvm/Support/raw_ostream.h>
 #include <cstdlib>
+#include <optional>
+#include <algorithm>
+#include <condition_variable>
+#include <mutex>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -666,6 +670,58 @@ static std::string attachPrivateRuntime(Module &part, const SmallVector<char, 0>
     return "";
 }
 
+// The order the workers of `optimizeInParts` take its parts in: largest
+// first, and a heavy part (over twice the average size) alone. A heavy part
+// starts only when no other part is running, and no part starts while it
+// runs, so its peak never adds to another part's.
+class PartSchedule {
+public:
+    explicit PartSchedule(const std::vector<size_t> &sizes) : heavy_(sizes.size(), false) {
+        size_t total = 0;
+        for (size_t size : sizes) total += size;
+        const size_t heavy_above = sizes.empty() ? 0 : 2 * total / sizes.size();
+        for (size_t index = 0; index < sizes.size(); index++) {
+            pending_.push_back(index);
+            heavy_[index] = sizes[index] > heavy_above;
+        }
+        std::stable_sort(pending_.begin(), pending_.end(), [&](size_t a, size_t b) { return sizes[a] > sizes[b]; });
+    }
+
+    std::optional<size_t> take() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            if (pending_.empty()) return std::nullopt;
+            if (!heavy_running_) {
+                const size_t index = pending_.front();
+                if (!heavy_[index] || running_ == 0) {
+                    pending_.erase(pending_.begin());
+                    running_++;
+                    heavy_running_ = heavy_[index];
+                    return index;
+                }
+            }
+            changed_.wait(lock);
+        }
+    }
+
+    void finish(size_t index) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_--;
+            if (heavy_[index]) heavy_running_ = false;
+        }
+        changed_.notify_all();
+    }
+
+private:
+    std::vector<size_t> pending_;
+    std::vector<bool> heavy_;
+    size_t running_ = 0;
+    bool heavy_running_ = false;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+};
+
 // Optimizes `llvm_module` in `parts` pieces at once and links them into
 // `merged`, which code generation then emits in its place. LLVM contexts are
 // not thread-safe, so each piece crosses to its worker as bitcode and is
@@ -695,7 +751,11 @@ static bool optimizeInParts(TargetMachine &target_machine, Module &llvm_module,
         runtime_routines.empty() ? SmallVector<char, 0>() : privateRuntimeCopy(llvm_module, runtime_routines);
 
     std::vector<SmallVector<char, 0>> inputs;
+    std::vector<size_t> part_sizes;
     SplitModule(llvm_module, parts, [&](std::unique_ptr<Module> part) {
+        size_t instructions = 0;
+        for (const Function &function : *part) instructions += function.getInstructionCount();
+        part_sizes.push_back(instructions);
         SmallVector<char, 0> &buffer = inputs.emplace_back();
         raw_svector_ostream stream(buffer);
         WriteBitcodeToFile(*part, stream);
@@ -767,15 +827,22 @@ static bool optimizeInParts(TargetMachine &target_machine, Module &llvm_module,
                 raw_svector_ostream stream(outputs[index]);
                 WriteBitcodeToFile(*part, stream);
         };
-        std::atomic<size_t> next_part{0};
+        // Optimizing and emitting a part takes memory in proportion to its
+        // largest procedures, and one huge procedure can make its part several
+        // times the size of the rest: on Atlas's coach config, emitting the
+        // part holding a procedure of a million instructions took 6 GiB, and
+        // with other parts beside it set the build's peak. A heavy part runs
+        // alone (`PartSchedule`).
+        PartSchedule schedule(part_sizes);
         std::vector<llvm::thread> workers;
         const size_t thread_count = std::min<size_t>(threads, inputs.size());
         for (size_t thread = 0; thread < thread_count; thread++) {
             // Large procedures recurse deeply in some passes; give each worker
             // the stack a main thread would have.
             workers.emplace_back(std::optional<unsigned>(256u << 20), [&] {
-                for (size_t index = next_part.fetch_add(1); index < inputs.size(); index = next_part.fetch_add(1)) {
-                    process(index);
+                for (std::optional<size_t> index = schedule.take(); index.has_value(); index = schedule.take()) {
+                    process(*index);
+                    schedule.finish(*index);
                 }
             });
         }
