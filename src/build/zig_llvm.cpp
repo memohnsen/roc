@@ -35,6 +35,10 @@
 #include <llvm/Transforms/IPO/ForceFunctionAttrs.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <llvm/Transforms/Utils/SplitModule.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/IR/Constants.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/InitializePasses.h>
@@ -556,6 +560,112 @@ static bool optimizeModule(TargetMachine &target_machine, Module &llvm_module,
     return false;
 }
 
+// The private runtime's routines (builder.zig `linkPrivateRuntime`): the
+// definitions of local linkage that `llvm.compiler.used` keeps for the calls
+// LLVM's code generator introduces.
+static std::vector<std::string> privateRuntimeRoutines(Module &module) {
+    std::vector<std::string> names;
+    GlobalVariable *used = module.getNamedGlobal("llvm.compiler.used");
+    if (used == nullptr || !used->hasInitializer()) return names;
+    auto *array = dyn_cast<ConstantArray>(used->getInitializer());
+    if (array == nullptr) return names;
+    for (const Use &operand : array->operands()) {
+        auto *value = dyn_cast<GlobalValue>(operand->stripPointerCasts());
+        if (value != nullptr && value->hasLocalLinkage() && !value->isDeclaration() && value->hasName()) {
+            names.push_back(value->getName().str());
+        }
+    }
+    return names;
+}
+
+// A bitcode copy of `routines` and every local definition they reach, with
+// the routines external so a part's declarations of them resolve to it.
+static SmallVector<char, 0> privateRuntimeCopy(Module &module, const std::vector<std::string> &routines) {
+    SmallPtrSet<const GlobalValue *, 32> keep;
+    SmallPtrSet<const Value *, 32> seen;
+    SmallVector<const Value *, 256> work;
+    for (const std::string &name : routines) {
+        if (GlobalValue *value = module.getNamedValue(name)) work.push_back(value);
+    }
+    while (!work.empty()) {
+        const Value *value = work.pop_back_val();
+        if (!seen.insert(value).second) continue;
+        if (auto *global = dyn_cast<GlobalValue>(value)) {
+            if (!global->hasLocalLinkage() || global->isDeclaration()) continue;
+            keep.insert(global);
+            if (auto *function = dyn_cast<Function>(global)) {
+                for (const BasicBlock &block : *function) {
+                    for (const Instruction &instruction : block) {
+                        for (const Use &operand : instruction.operands()) work.push_back(operand.get());
+                    }
+                }
+            } else if (auto *variable = dyn_cast<GlobalVariable>(global)) {
+                if (variable->hasInitializer()) work.push_back(variable->getInitializer());
+            } else if (auto *alias = dyn_cast<GlobalAlias>(global)) {
+                work.push_back(alias->getAliasee());
+            }
+            continue;
+        }
+        if (auto *constant = dyn_cast<Constant>(value)) {
+            for (const Use &operand : constant->operands()) work.push_back(operand.get());
+        }
+    }
+
+    ValueToValueMapTy map;
+    std::unique_ptr<Module> copy = CloneModule(module, map, [&](const GlobalValue *global) { return keep.count(global) != 0; });
+    std::vector<GlobalVariable *> intrinsic_globals;
+    for (GlobalVariable &variable : copy->globals()) {
+        if (variable.getName().starts_with("llvm.")) intrinsic_globals.push_back(&variable);
+    }
+    for (GlobalVariable *variable : intrinsic_globals) variable->eraseFromParent();
+    for (const std::string &name : routines) {
+        if (GlobalValue *value = copy->getNamedValue(name)) {
+            value->setLinkage(GlobalValue::ExternalLinkage);
+            value->setVisibility(GlobalValue::DefaultVisibility);
+        }
+    }
+    SmallVector<char, 0> buffer;
+    raw_svector_ostream stream(buffer);
+    WriteBitcodeToFile(*copy, stream);
+    return buffer;
+}
+
+// Splitting externalizes the private runtime's routines into one part, where
+// a native link would export them beside the host's own `memcpy` and the
+// like. Give every part its own internal copy instead, kept through
+// `llvm.compiler.used`, as a whole module has.
+static std::string attachPrivateRuntime(Module &part, const SmallVector<char, 0> &runtime_copy,
+    const std::vector<std::string> &routines)
+{
+    if (GlobalVariable *used = part.getNamedGlobal("llvm.compiler.used")) used->eraseFromParent();
+    Expected<std::unique_ptr<Module>> parsed = parseBitcodeFile(
+        MemoryBufferRef(StringRef(runtime_copy.data(), runtime_copy.size()), "private runtime"), part.getContext());
+    if (!parsed) return toString(parsed.takeError());
+    std::unique_ptr<Module> runtime = std::move(*parsed);
+    for (const std::string &name : routines) {
+        GlobalValue *own = part.getNamedValue(name);
+        if (own == nullptr || own->isDeclaration()) continue;
+        own->setLinkage(GlobalValue::ExternalLinkage);
+        if (Function *function = runtime->getFunction(name)) {
+            function->deleteBody();
+        } else if (GlobalVariable *variable = runtime->getNamedGlobal(name)) {
+            variable->setInitializer(nullptr);
+            variable->setLinkage(GlobalValue::ExternalLinkage);
+        }
+    }
+    if (Linker::linkModules(part, std::move(runtime))) return "cannot link the private runtime into an optimized part";
+    SmallVector<GlobalValue *, 16> kept;
+    for (const std::string &name : routines) {
+        GlobalValue *value = part.getNamedValue(name);
+        if (value == nullptr || value->isDeclaration()) continue;
+        value->setLinkage(GlobalValue::InternalLinkage);
+        value->setVisibility(GlobalValue::DefaultVisibility);
+        kept.push_back(value);
+    }
+    appendToCompilerUsed(part, kept);
+    return "";
+}
+
 // Optimizes `llvm_module` in `parts` pieces at once and links them into
 // `merged`, which code generation then emits in its place. LLVM contexts are
 // not thread-safe, so each piece crosses to its worker as bitcode and is
@@ -576,6 +686,13 @@ static bool optimizeInParts(TargetMachine &target_machine, Module &llvm_module,
             private_symbols.emplace_back(value.getName().str(), value.getLinkage());
         }
     }
+
+    // Only separate objects keep the split's linkage; a merged module gets the
+    // original linkage back below.
+    const std::vector<std::string> runtime_routines =
+        objects != nullptr ? privateRuntimeRoutines(llvm_module) : std::vector<std::string>();
+    const SmallVector<char, 0> runtime_copy =
+        runtime_routines.empty() ? SmallVector<char, 0>() : privateRuntimeCopy(llvm_module, runtime_routines);
 
     std::vector<SmallVector<char, 0>> inputs;
     SplitModule(llvm_module, parts, [&](std::unique_ptr<Module> part) {
@@ -608,6 +725,13 @@ static bool optimizeInParts(TargetMachine &target_machine, Module &llvm_module,
                 }
                 std::unique_ptr<Module> part = std::move(*parsed);
                 inputs[index] = SmallVector<char, 0>();
+                if (!runtime_routines.empty()) {
+                    std::string attach_error = attachPrivateRuntime(*part, runtime_copy, runtime_routines);
+                    if (!attach_error.empty()) {
+                        errors[index] = attach_error;
+                        return;
+                    }
+                }
                 std::unique_ptr<TargetMachine> part_machine(target_machine.getTarget().createTargetMachine(
                     target_machine.getTargetTriple(), target_machine.getTargetCPU(),
                     target_machine.getTargetFeatureString(), target_machine.Options,
