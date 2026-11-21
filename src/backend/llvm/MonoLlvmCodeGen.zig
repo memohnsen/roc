@@ -4076,13 +4076,12 @@ pub const MonoLlvmCodeGen = struct {
         }
     }
 
-    /// Explicit entrypoint membership and the body facts the always-inline
-    /// decision consumes: size, loops, opaque calls, and direct callees.
+    /// The body facts the always-inline decision consumes: size, loops,
+    /// opaque calls, and direct callees.
     const InlineShape = struct {
         count: usize = 0,
         has_loop: bool = false,
         opaque_call: bool = false,
-        application_entry: bool = false,
         callees: std.ArrayList(LirProcSpecId) = .empty,
     };
 
@@ -4111,21 +4110,19 @@ pub const MonoLlvmCodeGen = struct {
     /// than its LIR is. Two shapes are inlined everywhere, because their
     /// per-call cost in their callers' loops exceeds the work they do: a
     /// wrapper (no loop, few statements of its own) and a leaf (moderate
-    /// size, no calls). Larger bodies remain ordinary calls, so LLVM can
+    /// size, calls nothing). Larger bodies remain ordinary calls, so LLVM can
     /// simplify them before deciding whether to duplicate them into their
     /// callers. That is a speed policy; a size build selects nothing and
     /// leaves every decision to LLVM's size cost model.
     ///
-    /// A leaf is judged by the body it has once its always-inline callees
-    /// are expanded into it, which is the body LLVM emits: it calls nothing
-    /// only when every proc it calls is inlined everywhere and calls nothing
-    /// itself, and its size counts a copy of each such callee at each of its
-    /// call sites. A helper is a leaf whether an earlier stage inlined its
-    /// callees into it or this selection does, and a leaf's every call site
-    /// duplicates at most `max_leaf_inline_stmts` statements of expanded
-    /// body either way. A proc on a cycle of direct calls always keeps a
-    /// call, so it is never a leaf.
+    /// A leaf calls nothing in its own body. A helper that calls only
+    /// procedures inlined everywhere is not one: forcing such helpers in as
+    /// well grew Atlas's coach config 36% through LLVM's simplification, its
+    /// largest procedure to 1.26 million instructions, and an optimized build
+    /// with three workers from 383 s at 11.7 GiB to 535 s at 15.0 GiB, for
+    /// 6% faster code. LLVM's own inliner still decides those calls.
     fn computeInlineEverywhere(self: *MonoLlvmCodeGen, procs: []const LirProcSpec, entrypoints: []const Entrypoint) Error!void {
+        _ = entrypoints;
         self.inline_everywhere.clearRetainingCapacity();
         try self.inline_everywhere.appendNTimes(self.allocator, false, procs.len);
         if (self.optimize_for_size) return;
@@ -4135,79 +4132,16 @@ pub const MonoLlvmCodeGen = struct {
             self.allocator.free(shapes);
         }
         @memset(shapes, .{});
-        if (self.program_kind == .platform) {
-            for (entrypoints) |entrypoint| shapes[@backingInt(entrypoint.proc)].application_entry = true;
-        }
         for (procs, 0..) |proc, i| {
             if (proc.is_static_initializer) continue;
             if (proc.body.get()) |body| try self.inlineShapeOf(body, &shapes[i]);
         }
-
-        const Expansion = struct {
-            state: enum { unvisited, active, done } = .unvisited,
-            /// Statements once every always-inline callee is expanded,
-            /// saturating.
-            size: usize = 0,
-            /// Whether a call remains once every always-inline callee is
-            /// expanded.
-            calls: bool = false,
-        };
-        const expansions = try self.allocator.alloc(Expansion, procs.len);
-        defer self.allocator.free(expansions);
-        @memset(expansions, .{});
-        const Frame = struct { proc: usize, next_callee: usize };
-        var stack: std.ArrayList(Frame) = .empty;
-        defer stack.deinit(self.allocator);
-
-        for (procs, 0..) |root_proc, root| {
-            if (root_proc.body == .none or root_proc.is_static_initializer) continue;
-            if (expansions[root].state != .unvisited) continue;
-            expansions[root] = .{ .state = .active, .size = shapes[root].count, .calls = shapes[root].opaque_call };
-            try stack.append(self.allocator, .{ .proc = root, .next_callee = 0 });
-            while (stack.items.len > 0) {
-                const frame = &stack.items[stack.items.len - 1];
-                const shape = &shapes[frame.proc];
-                if (frame.next_callee < shape.callees.items.len) {
-                    const callee: usize = @backingInt(shape.callees.items[frame.next_callee]);
-                    const callee_proc = procs[callee];
-                    if (callee_proc.body == .none or callee_proc.is_static_initializer) {
-                        expansions[frame.proc].calls = true;
-                        frame.next_callee += 1;
-                        continue;
-                    }
-                    switch (expansions[callee].state) {
-                        .unvisited => {
-                            expansions[callee] = .{ .state = .active, .size = shapes[callee].count, .calls = shapes[callee].opaque_call };
-                            try stack.append(self.allocator, .{ .proc = callee, .next_callee = 0 });
-                            continue;
-                        },
-                        // A call back into a proc still being expanded is a
-                        // cycle, which no amount of inlining removes.
-                        .active => expansions[frame.proc].calls = true,
-                        .done => {
-                            if (self.inline_everywhere.items[callee]) {
-                                expansions[frame.proc].size +|= expansions[callee].size;
-                                expansions[frame.proc].calls = expansions[frame.proc].calls or expansions[callee].calls;
-                            } else {
-                                expansions[frame.proc].calls = true;
-                            }
-                        },
-                    }
-                    frame.next_callee += 1;
-                    continue;
-                }
-                const finished = frame.proc;
-                _ = stack.pop();
-                const expansion = &expansions[finished];
-                expansion.state = .done;
-                const wrapper = shape.count <= max_wrapper_inline_stmts and !shape.has_loop;
-                // An application entry's single ABI-wrapper caller can inline
-                // it after simplification. Forcing transitive leaves in early
-                // pessimizes that code; retain the original direct-leaf rule.
-                const eligible_leaf = !shape.application_entry or shape.callees.items.len == 0;
-                const leaf = eligible_leaf and expansion.size <= max_leaf_inline_stmts and !expansion.calls;
-                self.inline_everywhere.items[finished] = wrapper or leaf;
-            }
+        for (procs, 0..) |proc, i| {
+            if (proc.body == .none or proc.is_static_initializer) continue;
+            const shape = &shapes[i];
+            const wrapper = shape.count <= max_wrapper_inline_stmts and !shape.has_loop;
+            const leaf = shape.count <= max_leaf_inline_stmts and shape.callees.items.len == 0 and !shape.opaque_call;
+            self.inline_everywhere.items[i] = wrapper or leaf;
         }
     }
 
@@ -16683,7 +16617,7 @@ test "issue 11451: forced inlining at deep call sites is capped per caller" {
     try std.testing.expect(forced_sites <= max_forced_sites);
 }
 
-test "a looping helper whose only callees are inlined everywhere is a leaf" {
+test "only a helper that calls nothing is a leaf, however its callees are inlined" {
     const gpa = std.testing.allocator;
     var store = lir.LirStore.init(gpa);
     defer store.deinit();
@@ -16775,27 +16709,11 @@ test "a looping helper whose only callees are inlined everywhere is a leaf" {
     try codegen.computeInlineEverywhere(store.getProcSpecs(), &.{});
 
     try std.testing.expect(codegen.inlineEverywhere(wrapper));
-    try std.testing.expect(codegen.inlineEverywhere(over_wrapper));
-    try std.testing.expect(codegen.inlineEverywhere(over_leaf));
+    try std.testing.expect(codegen.inlineEverywhere(direct_leaf));
+    try std.testing.expect(!codegen.inlineEverywhere(over_wrapper));
+    try std.testing.expect(!codegen.inlineEverywhere(over_leaf));
     try std.testing.expect(!codegen.inlineEverywhere(recursive));
     try std.testing.expect(!codegen.inlineEverywhere(over_recursive));
-
-    const entrypoints = [_]MonoLlvmCodeGen.Entrypoint{
-        .{ .symbol_name = "arbitrary_export", .proc = over_leaf, .arg_layouts = &.{.i64}, .ret_layout = .i64 },
-        .{ .symbol_name = "direct_export", .proc = direct_leaf, .arg_layouts = &.{.i64}, .ret_layout = .i64 },
-        .{ .symbol_name = "wrapper_export", .proc = wrapper, .arg_layouts = &.{.i64}, .ret_layout = .i64 },
-    };
-    codegen.program_kind = .platform;
-    try codegen.computeInlineEverywhere(store.getProcSpecs(), &entrypoints);
-    try std.testing.expect(!codegen.inlineEverywhere(over_leaf));
-    try std.testing.expect(codegen.inlineEverywhere(over_wrapper));
-    try std.testing.expect(codegen.inlineEverywhere(wrapper));
-    try std.testing.expect(codegen.inlineEverywhere(direct_leaf));
-
-    // Interpreter/CTFE entrypoints are not application entries.
-    codegen.program_kind = .in_process;
-    try codegen.computeInlineEverywhere(store.getProcSpecs(), &entrypoints);
-    try std.testing.expect(codegen.inlineEverywhere(over_leaf));
 }
 
 test "wasm C-ABI classification follows the target's SIMD support" {
