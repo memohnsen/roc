@@ -20666,6 +20666,9 @@ pub fn scopeIntroduceInternal(
         // Regular shadowing case - produce warning but still introduce
         try self.putScopeBinding(gpa, item_kind, self.scopes.items.len - 1, ident_idx, pattern_idx);
 
+        if (item_kind == .ident and self.shadowsLaterModuleDefinition(existing_binding.scope_idx, existing, pattern_idx)) {
+            return Scope.IntroduceResult{ .success = {} };
+        }
         return Scope.IntroduceResult{ .shadowing_warning = existing };
     }
 
@@ -20673,6 +20676,25 @@ pub fn scopeIntroduceInternal(
     try self.putScopeBinding(gpa, item_kind, self.scopes.items.len - 1, ident_idx, pattern_idx);
 
     return Scope.IntroduceResult{ .success = {} };
+}
+
+/// Whether a local binding or parameter (`new`, introduced in the current
+/// scope) shadows a definition of the module itself (`existing`, a top-level
+/// value or a member of a module-level type's associated block) that is
+/// written later in the source. Such a local is not reported: a type's
+/// members are all in scope from the start of its block, so a local named
+/// like a member written further down would otherwise warn, which members
+/// introduced in source order never did. A definition written earlier, a
+/// member shadowing another member, and every other shadowing are reported.
+fn shadowsLaterModuleDefinition(self: *Self, existing_scope: usize, existing: Pattern.Idx, new: Pattern.Idx) bool {
+    const current_scope = self.scopes.items.len - 1;
+    if (current_scope == 0 or self.scopes.items[current_scope].associated_type_name != null) return false;
+    for (self.scopes.items[1 .. existing_scope + 1]) |scope| {
+        if (scope.associated_type_name == null) return false;
+    }
+    const existing_start = self.env.store.getPatternRegion(existing).start.offset;
+    const new_start = self.env.store.getPatternRegion(new).start.offset;
+    return existing_start > new_start;
 }
 
 /// Check if an identifier is marked as ignored (underscore prefix)

@@ -153,14 +153,14 @@ fn countShadowingWarnings(source: []const u8, name: []const u8) Issue12962TestEr
     return shadowing_warnings;
 }
 
-test "issue 12962: a lambda parameter shadowing a later block member is reported" {
+test "issue 12962: a lambda parameter shadowing a later block member is not reported" {
     const source =
         \\T := [].{
         \\    f = |double| double
         \\    double = |n| n
         \\}
     ;
-    try std.testing.expectEqual(@as(usize, 1), try countShadowingWarnings(source, "double"));
+    try std.testing.expectEqual(@as(usize, 0), try countShadowingWarnings(source, "double"));
 }
 
 test "issue 12962: a lambda parameter shadowing an earlier block member is reported" {

@@ -124,6 +124,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/issue_10151_test.zig"));
     std.testing.refAllDecls(@import("test/issue_10338_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12962_test.zig"));
+    std.testing.refAllDecls(@import("test/later_definition_shadowing_test.zig"));
     std.testing.refAllDecls(@import("test/roc_version_test.zig"));
     std.testing.refAllDecls(@import("test/import_validation_test.zig"));
     std.testing.refAllDecls(@import("test/int_test.zig"));
