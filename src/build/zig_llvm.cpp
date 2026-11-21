@@ -828,6 +828,23 @@ static bool optimizeInParts(TargetMachine &target_machine, Module &llvm_module,
     return false;
 }
 
+// Hands the timing report to the caller. This must only happen once we know
+// we've succeeded and will be returning `false`, because this code `malloc`s
+// memory which will become owned by the caller (in Zig code).
+static void writeTimeReport(const ZigLLVMEmitOptions *options) {
+    if (options->time_report_out == nullptr) return;
+    std::string out_str;
+    auto os = raw_string_ostream(out_str);
+    TimerGroup::printAll(os);
+    TimerGroup::clearAll();
+    // On allocation failure the report stays null, which the caller reports as out of memory.
+    auto c_str = (char *)malloc(out_str.length() + 1);
+    if (c_str != nullptr) {
+        strcpy(c_str, out_str.c_str());
+    }
+    *options->time_report_out = c_str;
+}
+
 // Runs the optimization and code generation pipeline, writing the object (or
 // LTO bitcode) to `dest_bin` when it is non-null. The assembly and bitcode
 // outputs named in `options` are written to their files.
@@ -887,10 +904,12 @@ static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleR
     const unsigned threads = options->optimize_threads;
     const unsigned parts_per_thread = 4;
 
-    // Splitting needs a whole optimized object as the only output.
+    // Splitting needs a whole optimized object as the only output. A timing
+    // report (`--timings`) must not change how the program is optimized: it
+    // used to turn splitting off, which ran the whole pipeline on one thread
+    // and doubled the stock UI's LLVM phase.
     const bool split = threads > 1 && opt_level != OptimizationLevel::O0 && !options->lto && dest_bin != nullptr &&
-        !dest_asm && !dest_bitcode && options->llvm_ir_filename == nullptr && !options->sancov && !options->tsan &&
-        !TimePassesIsEnabled;
+        !dest_asm && !dest_bitcode && options->llvm_ir_filename == nullptr && !options->sancov && !options->tsan;
     Module *codegen_module = &llvm_module;
     std::unique_ptr<Module> merged;
     if (split) {
@@ -899,6 +918,10 @@ static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleR
         // the pipeline works within each function or each part, and part of it
         // grows faster than the module, so it runs in parts.
         if (optimizeModule(target_machine, llvm_module, options, OptimizeStage::simplify, error_message)) return true;
+        // LLVM's pass timers are not safe to run on several threads at once,
+        // so the report covers the whole-module simplification, which runs
+        // here on this thread, and not the parts.
+        TimePassesIsEnabled = false;
         const bool separate_objects = options->object_parts_written != nullptr && options->bin_filename != nullptr;
         std::vector<SmallVector<char, 0>> objects;
         if (optimizeInParts(target_machine, llvm_module, options, threads * parts_per_thread, threads, OptimizeStage::finish, merged,
@@ -920,6 +943,7 @@ static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleR
                 part_file.write(objects[index].data(), objects[index].size());
             }
             *options->object_parts_written = static_cast<unsigned>(objects.size());
+            writeTimeReport(options);
             return false;
         }
         codegen_module = merged.get();
@@ -943,20 +967,7 @@ static bool emitWithBinStream(LLVMTargetMachineRef targ_machine_ref, LLVMModuleR
         WriteBitcodeToFile(llvm_module, *dest_bitcode);
     }
 
-    // This must only happen once we know we've succeeded and will be returning `false`, because
-    // this code `malloc`s memory which will become owned by the caller (in Zig code).
-    if (options->time_report_out != nullptr) {
-        std::string out_str;
-        auto os = raw_string_ostream(out_str);
-        TimerGroup::printAll(os);
-        TimerGroup::clearAll();
-        // On allocation failure the report stays null, which the caller reports as out of memory.
-        auto c_str = (char *)malloc(out_str.length() + 1);
-        if (c_str != nullptr) {
-            strcpy(c_str, out_str.c_str());
-        }
-        *options->time_report_out = c_str;
-    }
+    writeTimeReport(options);
     return false;
 }
 
