@@ -765,6 +765,14 @@ static bool optimizeInParts(TargetMachine &target_machine, Module &llvm_module,
     for (Function &function : llvm_module) {
         function.deleteBody();
     }
+    // Separate objects need nothing more from the caller's module: free it
+    // and its context before the parts' peak instead of beside it.
+    if (objects != nullptr && options->module_consumed != nullptr) {
+        LLVMContext *context = &llvm_module.getContext();
+        delete &llvm_module;
+        delete context;
+        *options->module_consumed = true;
+    }
 
     std::vector<SmallVector<char, 0>> outputs(inputs.size());
     std::vector<std::string> errors(inputs.size());

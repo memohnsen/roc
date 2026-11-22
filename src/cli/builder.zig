@@ -239,6 +239,7 @@ const ZigLLVMEmitOptions = extern struct {
     lower_memory_intrinsics_to_loops: bool,
     optimize_threads: c_uint,
     object_parts_written: ?*c_uint,
+    module_consumed: ?*bool,
 };
 
 // LLVM Code Generation Optimization Levels
@@ -296,7 +297,6 @@ const llvm_externs = if (llvm_available) struct {
     extern fn LLVMGetTargetFromTriple(triple: [*:0]const u8, target: *?*anyopaque, error_message: *[*:0]u8) c_int;
     extern fn LLVMDisposeMessage(message: [*:0]u8) void;
     extern fn LLVMCreateMemoryBufferWithContentsOfFile(path: [*:0]const u8, out_mem_buf: *?*anyopaque, out_message: *[*:0]u8) c_int;
-    extern fn LLVMParseBitcode(mem_buf: ?*anyopaque, out_module: *?*anyopaque, out_message: *[*:0]u8) c_int;
     extern fn LLVMDisposeMemoryBuffer(mem_buf: ?*anyopaque) void;
     extern fn LLVMDisposeModule(module: ?*anyopaque) void;
     extern fn LLVMDisposeTargetMachine(target_machine: ?*anyopaque) void;
@@ -305,7 +305,9 @@ const llvm_externs = if (llvm_available) struct {
     // can inline builtin calls (e.g. list_append_unsafe) instead of leaving them
     // as opaque external calls.
     extern fn LLVMCreateMemoryBufferWithMemoryRangeCopy(data: [*]const u8, len: usize, name: [*:0]const u8) ?*anyopaque;
-    extern fn LLVMParseBitcode2(mem_buf: ?*anyopaque, out_module: *?*anyopaque) c_int;
+    extern fn LLVMParseBitcodeInContext2(context: ?*anyopaque, mem_buf: ?*anyopaque, out_module: *?*anyopaque) c_int;
+    extern fn LLVMContextCreate() ?*anyopaque;
+    extern fn LLVMContextDispose(context: ?*anyopaque) void;
     extern fn LLVMLinkModules2(dest: ?*anyopaque, src: ?*anyopaque) c_int;
     extern fn LLVMGetFirstFunction(module: ?*anyopaque) ?*anyopaque;
     extern fn LLVMGetNextFunction(fn_val: ?*anyopaque) ?*anyopaque;
@@ -561,7 +563,7 @@ fn linkPrivateRuntime(module: ?*anyopaque, bitcode: []const u8, target_triple_z:
     const externs = llvm_externs;
     const buffer = externs.LLVMCreateMemoryBufferWithMemoryRangeCopy(bitcode.ptr, bitcode.len, "roc-llvm-private-runtime-bc");
     var runtime_module: ?*anyopaque = null;
-    if (externs.LLVMParseBitcode2(buffer, &runtime_module) != 0) return false;
+    if (externs.LLVMParseBitcodeInContext2(externs.LLVMGetModuleContext(module), buffer, &runtime_module) != 0) return false;
     externs.LLVMSetTarget(runtime_module, target_triple_z);
     externs.LLVMSetDataLayout(runtime_module, externs.LLVMGetDataLayoutStr(module));
     if (externs.LLVMGetNamedGlobal(runtime_module, "llvm.used")) |used| externs.LLVMDeleteGlobal(used);
@@ -668,18 +670,25 @@ pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileCon
         externs.LLVMDisposeMessage(error_message);
         return false;
     }
-    defer if (mem_buf) |buf| externs.LLVMDisposeMemoryBuffer(buf);
     std.log.debug("Bitcode file loaded successfully", .{});
 
-    // 3. Parse bitcode into module
+    // 3. Parse bitcode into a module, in an LLVM context of its own: optimizing
+    // in parts frees both once the parts are split off (`module_consumed`),
+    // where the global context would keep everything parsed into it until the
+    // process ends.
     std.log.debug("Parsing bitcode into LLVM module...", .{});
+    const module_context = externs.LLVMContextCreate();
+    var module_consumed = false;
+    defer if (!module_consumed) externs.LLVMContextDispose(module_context);
     var module: ?*anyopaque = null;
-    if (externs.LLVMParseBitcode(mem_buf, &module, &error_message) != 0) {
-        try renderLLVMError(gpa, "Bitcode Parse Error", "Failed to parse bitcode.", std.mem.span(error_message), config.report_config);
-        externs.LLVMDisposeMessage(error_message);
+    const parse_failed = externs.LLVMParseBitcodeInContext2(module_context, mem_buf, &module) != 0;
+    // The module holds everything it read; drop the file's bytes before LLVM's peak.
+    externs.LLVMDisposeMemoryBuffer(mem_buf);
+    if (parse_failed) {
+        try renderLLVMError(gpa, "Bitcode Parse Error", "Failed to parse bitcode.", "LLVM could not read the bitcode file", config.report_config);
         return false;
     }
-    defer if (module) |mod| externs.LLVMDisposeModule(mod);
+    defer if (!module_consumed) if (module) |mod| externs.LLVMDisposeModule(mod);
     std.log.debug("Bitcode parsed successfully", .{});
 
     // 4. Get target triple and set it on the module
@@ -757,13 +766,13 @@ pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileCon
 
         const bc_buf = externs.LLVMCreateMemoryBufferWithMemoryRangeCopy(builtins_bc.ptr, builtins_bc.len, "roc-builtins-bc");
         var builtins_module: ?*anyopaque = null;
-        if (externs.LLVMParseBitcode2(bc_buf, &builtins_module) == 0) {
+        if (externs.LLVMParseBitcodeInContext2(externs.LLVMGetModuleContext(module), bc_buf, &builtins_module) == 0) {
             externs.LLVMSetTarget(builtins_module, target_triple_z.ptr);
             externs.LLVMSetDataLayout(builtins_module, externs.LLVMGetDataLayoutStr(module));
             if (selectSha256RoundsBitcode(config.target.ptrBitWidth(), linked_builtins.sha256_rounds)) |rounds_bc| {
                 const rounds_buf = externs.LLVMCreateMemoryBufferWithMemoryRangeCopy(rounds_bc.ptr, rounds_bc.len, "roc-sha256-rounds-bc");
                 var rounds_module: ?*anyopaque = null;
-                if (externs.LLVMParseBitcode2(rounds_buf, &rounds_module) != 0) {
+                if (externs.LLVMParseBitcodeInContext2(externs.LLVMGetModuleContext(module), rounds_buf, &rounds_module) != 0) {
                     std.log.err("Failed to parse SHA-256 rounds bitcode", .{});
                     return false;
                 }
@@ -779,7 +788,7 @@ pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileCon
             if (selectUtf8KernelBitcode(config.target.ptrBitWidth(), linked_builtins.utf8_kernel)) |kernel_bc| {
                 const kernel_buf = externs.LLVMCreateMemoryBufferWithMemoryRangeCopy(kernel_bc.ptr, kernel_bc.len, "roc-utf8-kernel-bc");
                 var kernel_module: ?*anyopaque = null;
-                if (externs.LLVMParseBitcode2(kernel_buf, &kernel_module) != 0) {
+                if (externs.LLVMParseBitcodeInContext2(externs.LLVMGetModuleContext(module), kernel_buf, &kernel_module) != 0) {
                     std.log.err("Failed to parse UTF-8 kernel bitcode", .{});
                     return false;
                 }
@@ -1060,6 +1069,7 @@ pub fn compileBitcodeToObject(gpa: Allocator, std_io: std.Io, config: CompileCon
         .lower_memory_intrinsics_to_loops = config.lower_memory_intrinsics_to_loops,
         .optimize_threads = config.optimize_threads,
         .object_parts_written = config.object_parts_out,
+        .module_consumed = &module_consumed,
     };
 
     // LLVM keeps this limit in process-wide options that code generation

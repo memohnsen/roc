@@ -695,6 +695,7 @@ fn emitMergedBitcodeModulesToObject(
         .lower_memory_intrinsics_to_loops = options.lower_memory_intrinsics_to_loops,
         .optimize_threads = 1,
         .object_parts_written = null,
+        .module_consumed = null,
     };
 
     // In-process objects are for the host, which keeps LLVM's own memory

@@ -96,6 +96,12 @@ struct ZigLLVMEmitOptions {
     // `<bin_filename>.<i>.o`, and the part count is stored here. When null,
     // the parts are linked back into one module and emitted as one object.
     unsigned *object_parts_written;
+    // When not null and the module is optimized in parts as separate objects,
+    // the module and its LLVM context are freed once the parts are split off,
+    // before any part is optimized, and true is stored here: the caller then
+    // disposes neither. The context must be one the caller created for this
+    // module alone.
+    bool *module_consumed;
 };
 
 // synchronize with llvm/include/Object/Archive.h::Object::Archive::Kind

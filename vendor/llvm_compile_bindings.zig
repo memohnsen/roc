@@ -203,6 +203,7 @@ pub const TargetMachine = opaque {
         lower_memory_intrinsics_to_loops: bool,
         optimize_threads: c_uint,
         object_parts_written: ?*c_uint,
+        module_consumed: ?*bool,
 
         pub const LtoPhase = enum(c_int) {
             None,
@@ -437,6 +438,7 @@ pub fn compileBitcodeToObject(
         .lower_memory_intrinsics_to_loops = false,
         .optimize_threads = 1,
         .object_parts_written = null,
+        .module_consumed = null,
     };
 
     // Emit object file with the target's own memory intrinsic expansion
