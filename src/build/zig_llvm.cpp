@@ -638,6 +638,18 @@ static SmallVector<char, 0> privateRuntimeCopy(Module &module, const std::vector
 // a native link would export them beside the host's own `memcpy` and the
 // like. Give every part its own internal copy instead, kept through
 // `llvm.compiler.used`, as a whole module has.
+// LLVM's x86 assembly printer declares `_fltused` global in every COFF object
+// that uses floating point, so each part's private copy would become one more
+// strong definition, and MSVC's linker refuses the duplicates (LNK2005). A
+// selectany COMDAT lets the linker keep any one of them.
+static void shareFloatingPointMarker(Module &part) {
+    if (!Triple(part.getTargetTriple()).isOSBinFormatCOFF()) return;
+    GlobalVariable *marker = part.getNamedGlobal("_fltused");
+    if (marker == nullptr || marker->isDeclaration()) return;
+    marker->setLinkage(GlobalValue::WeakODRLinkage);
+    marker->setComdat(part.getOrInsertComdat(marker->getName()));
+}
+
 static std::string attachPrivateRuntime(Module &part, const SmallVector<char, 0> &runtime_copy,
     const std::vector<std::string> &routines)
 {
@@ -667,6 +679,7 @@ static std::string attachPrivateRuntime(Module &part, const SmallVector<char, 0>
         kept.push_back(value);
     }
     appendToCompilerUsed(part, kept);
+    shareFloatingPointMarker(part);
     return "";
 }
 
