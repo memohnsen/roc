@@ -3532,6 +3532,47 @@ test "single-use block helper with statements is inlined" {
     , "wrapper", true);
 }
 
+/// A module whose `main` calls three single-use helpers, each a chain of
+/// `let`s of the given length: two large ones that `main` cannot inline both
+/// of within `max_single_use_inline_nodes`, and a small one.
+fn singleUseChainSource(allocator: Allocator, larger: usize, smaller: usize) Allocator.Error![]u8 {
+    var source: std.ArrayList(u8) = .empty;
+    errdefer source.deinit(allocator);
+    for ([_]struct { name: []const u8, lets: usize }{
+        .{ .name = "larger", .lets = larger },
+        .{ .name = "smaller", .lets = smaller },
+        .{ .name = "small", .lets = 4 },
+    }) |helper| {
+        try source.print(allocator, "{s} : U64 -> U64\n{s} = |x| {{\n    a0 = x * 3\n", .{ helper.name, helper.name });
+        for (1..helper.lets) |i| try source.print(allocator, "    a{d} = a{d} * 3 + {d}\n", .{ i, i - 1, i });
+        try source.print(allocator, "    a{d}\n}}\n\n", .{helper.lets - 1});
+    }
+    try source.appendSlice(allocator,
+        \\main : U64 -> U64
+        \\main = |x| larger(x) + smaller(x) + small(x)
+        \\
+    );
+    return source.toOwnedSlice(allocator);
+}
+
+test "single-use inlining keeps the largest callee a procedure once its caller would pass the bound" {
+    const allocator = std.testing.allocator;
+    const source = try singleUseChainSource(allocator, 6_000, 3_000);
+    defer allocator.free(source);
+    try expectInlinePlanDecision(source, "larger", false);
+    try expectInlinePlanDecision(source, "smaller", true);
+    try expectInlinePlanDecision(source, "small", true);
+}
+
+test "single-use inlining within the bound inlines every callee" {
+    const allocator = std.testing.allocator;
+    const source = try singleUseChainSource(allocator, 400, 200);
+    defer allocator.free(source);
+    try expectInlinePlanDecision(source, "larger", true);
+    try expectInlinePlanDecision(source, "smaller", true);
+    try expectInlinePlanDecision(source, "small", true);
+}
+
 test "multi-use block helper with statements is not inlined" {
     try expectInlinePlanDecision(
         \\helper : List(U64), U64 -> List(U64)

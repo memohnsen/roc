@@ -33,6 +33,13 @@ pub const Mode = enum {
     wrappers_and_source_single_use,
 };
 
+/// The most lifted nodes a function may hold once every single-use body is
+/// inlined into it (`InlineAnalyzer.boundSingleUseGrowth`). On Atlas's desktop
+/// UI it splits 16 bodies off a chain of 142,818 nodes, which cut its largest
+/// LLVM procedure from 1.0 M instructions to 278 K and an optimized build's
+/// peak from 11.1 GiB to about 8 GiB.
+pub const max_single_use_inline_nodes: usize = 50_000;
+
 /// What an inline body is.
 pub const InlineKind = enum(u8) {
     none,
@@ -200,6 +207,7 @@ const InlineAnalyzer = struct {
             .rule = rule,
         };
         try analyzer.decideCandidates();
+        if (rule == .program) try analyzer.boundSingleUseGrowth();
 
         const materialization_states = try allocator.alloc(MaterializationState, decisions.len);
         defer allocator.free(materialization_states);
@@ -402,6 +410,115 @@ const InlineAnalyzer = struct {
         // Rejecting a cycle's wrappers can leave a cycle of single-use
         // bodies alone, which every member of then leaves.
         try self.rejectCandidateCycles(&graph, .accepted);
+    }
+
+    const GrowthState = enum(u8) { unvisited, visiting, done };
+
+    /// Bound what single-use inlining makes of one procedure. Each body the
+    /// program calls once is lowered into its caller, so a chain of them (an
+    /// app's `update` handing each event to its screens, and each screen to
+    /// its handlers) became one procedure of every handler's code: about a
+    /// million LLVM instructions in Atlas's desktop UI, whose code generation
+    /// alone took 6 GiB. Counted in lifted nodes with every single-use body
+    /// inlined into it, a function over `max_single_use_inline_nodes` keeps
+    /// its largest single-use callees as procedures of their own until it
+    /// fits, bottom up, so each callee has already been bounded the same way.
+    fn boundSingleUseGrowth(self: *InlineAnalyzer) std.mem.Allocator.Error!void {
+        const cap = max_single_use_inline_nodes;
+        const fn_count = self.decisions.len;
+        const first_child = try self.allocator.alloc(?u32, fn_count);
+        defer self.allocator.free(first_child);
+        const next_sibling = try self.allocator.alloc(?u32, fn_count);
+        defer self.allocator.free(next_sibling);
+        const totals = try self.allocator.alloc(usize, fn_count);
+        defer self.allocator.free(totals);
+        const states = try self.allocator.alloc(GrowthState, fn_count);
+        defer self.allocator.free(states);
+        @memset(first_child, null);
+        @memset(next_sibling, null);
+        @memset(totals, 0);
+        @memset(states, .unvisited);
+        for (self.decisions, 0..) |decision, index| {
+            if (decision != .inline_body or decision.inline_body.kind != .single_use) continue;
+            const owner = self.procedure_usage[index].external_call_owner orelse continue;
+            const owner_index = specIndex(owner);
+            next_sibling[index] = first_child[owner_index];
+            first_child[owner_index] = @intCast(index);
+        }
+
+        var walk: std.ArrayList(Lifted.ExprChild) = .empty;
+        defer walk.deinit(self.allocator);
+        var children: std.ArrayList(Lifted.ExprChild) = .empty;
+        defer children.deinit(self.allocator);
+        var kept: std.ArrayList(u32) = .empty;
+        defer kept.deinit(self.allocator);
+        const Frame = struct { index: u32, expanded: bool };
+        var stack: std.ArrayList(Frame) = .empty;
+        defer stack.deinit(self.allocator);
+
+        for (0..fn_count) |root| {
+            if (states[root] != .unvisited) continue;
+            try stack.append(self.allocator, .{ .index = @intCast(root), .expanded = false });
+            while (stack.pop()) |frame| {
+                const index = frame.index;
+                if (!frame.expanded) {
+                    if (states[index] != .unvisited) continue;
+                    states[index] = .visiting;
+                    try stack.append(self.allocator, .{ .index = index, .expanded = true });
+                    var child = first_child[index];
+                    while (child) |child_index| : (child = next_sibling[child_index]) {
+                        if (states[child_index] == .unvisited) try stack.append(self.allocator, .{ .index = child_index, .expanded = false });
+                    }
+                    continue;
+                }
+                var total = try self.ownBodySize(@fromBackingInt(index), &walk, &children);
+                kept.clearRetainingCapacity();
+                var child = first_child[index];
+                while (child) |child_index| : (child = next_sibling[child_index]) {
+                    if (states[child_index] != .done) continue;
+                    if (self.decisions[child_index] != .inline_body) continue;
+                    total += totals[child_index];
+                    try kept.append(self.allocator, child_index);
+                }
+                if (total > cap) {
+                    std.mem.sort(u32, kept.items, totals, struct {
+                        fn larger(sizes: []usize, a: u32, b: u32) bool {
+                            return if (sizes[a] != sizes[b]) sizes[a] > sizes[b] else a < b;
+                        }
+                    }.larger);
+                    for (kept.items) |child_index| {
+                        if (total <= cap) break;
+                        self.decisions[child_index] = .never;
+                        total -= totals[child_index];
+                    }
+                }
+                totals[index] = total;
+                states[index] = .done;
+            }
+        }
+    }
+
+    fn ownBodySize(self: *InlineAnalyzer, fn_id: SpecFnId, walk: *std.ArrayList(Lifted.ExprChild), children: *std.ArrayList(Lifted.ExprChild)) std.mem.Allocator.Error!usize {
+        const body = switch (self.solved.lifted.getFn(self.source(fn_id)).body) {
+            .roc => |body_expr| body_expr,
+            .hosted => return 1,
+        };
+        walk.clearRetainingCapacity();
+        try walk.append(self.allocator, .{ .expr = body });
+        var count: usize = 0;
+        while (walk.pop()) |item| {
+            count += 1;
+            children.clearRetainingCapacity();
+            switch (item) {
+                .stmt => |stmt_id| try Lifted.appendStmtChildren(self.allocator, &self.solved.lifted, stmt_id, children),
+                .expr => |expr_id| switch (self.solved.lifted.getExpr(expr_id).data) {
+                    .lambda, .fn_def => {},
+                    else => try Lifted.appendChildren(self.allocator, &self.solved.lifted, expr_id, children),
+                },
+            }
+            try walk.appendSlice(self.allocator, children.items);
+        }
+        return count;
     }
 
     const BodyShape = enum {
